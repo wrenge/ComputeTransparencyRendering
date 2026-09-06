@@ -1,0 +1,188 @@
+// Screen space binning: builds, for every tile, the list of triangles whose bounds
+// overlap it. The list is packed into a single pool sized by a prefix sum over the
+// per tile counts, so tiles that need many primitives can have them as long as the
+// average stays within the pool.
+#pragma kernel CSClear
+#pragma kernel CSCount
+#pragma kernel CSScanBlocks
+#pragma kernel CSScanBlockSums
+#pragma kernel CSScanAdd
+#pragma kernel CSScatter
+
+#include "CTCommon.hlsl"
+
+StructuredBuffer<CTTri> _CTTriangles;
+
+RWStructuredBuffer<uint> _CTTileCount;   // raw overlap count per tile
+RWStructuredBuffer<uint> _CTTileOffset;  // start of the tile's slice in _CTTileList
+RWStructuredBuffer<uint> _CTTileCursor;  // scatter write cursor per tile
+RWStructuredBuffer<uint> _CTBlockSums;   // per scan block totals, then block base offsets
+RWStructuredBuffer<uint> _CTTileList;    // the pool of triangle indices
+
+uint4 _CTTileParams;      // x = tilesX, y = tilesY, z = tileCount, w = block count
+uint  _CTTriCount;
+uint  _CTTileListCapacity;
+uint  _CTTileSize;        // tile edge in pixels, a renderer feature setting
+float4 _CTScreenSize;     // xy = pixels, zw = 1/pixels
+
+groupshared uint gsScan[CT_SCAN_GROUP];
+
+// Tile range covered by a triangle's screen space bounds, clamped to the screen.
+bool TriTileRange(CTTri t, out uint2 tileLo, out uint2 tileHi)
+{
+    tileLo = 0;
+    tileHi = 0;
+    if (t.payload.z == 0)
+        return false;
+
+    float2 lo, hi;
+    CTTriBounds(t, lo, hi);
+    lo = max(lo, 0.0);
+    hi = min(hi, _CTScreenSize.xy - 1.0);
+    if (any(lo > hi))
+        return false;
+
+    tileLo = (uint2)(lo / _CTTileSize);
+    tileHi = (uint2)(hi / _CTTileSize);
+    tileHi = min(tileHi, _CTTileParams.xy - 1);
+    return true;
+}
+
+[numthreads(CT_SCAN_GROUP, 1, 1)]
+void CSClear(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i < _CTTileParams.z)
+    {
+        _CTTileCount[i] = 0;
+        _CTTileCursor[i] = 0;
+    }
+    if (i < _CTTileParams.w)
+        _CTBlockSums[i] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void CSCount(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CTTriCount)
+        return;
+
+    uint2 tileLo, tileHi;
+    if (!TriTileRange(_CTTriangles[i], tileLo, tileHi))
+        return;
+
+    for (uint ty = tileLo.y; ty <= tileHi.y; ty++)
+    {
+        uint row = ty * _CTTileParams.x;
+        for (uint tx = tileLo.x; tx <= tileHi.x; tx++)
+        {
+            uint prev;
+            InterlockedAdd(_CTTileCount[row + tx], 1, prev);
+        }
+    }
+}
+
+// Exclusive scan inside one block of CT_SCAN_GROUP tiles, plus the block total.
+[numthreads(CT_SCAN_GROUP, 1, 1)]
+void CSScanBlocks(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint tid : SV_GroupIndex)
+{
+    uint i = id.x;
+    uint v = (i < _CTTileParams.z) ? min(_CTTileCount[i], CT_MAX_TILE_PRIMS) : 0;
+    gsScan[tid] = v;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint offset = 1; offset < CT_SCAN_GROUP; offset <<= 1)
+    {
+        uint add = (tid >= offset) ? gsScan[tid - offset] : 0;
+        GroupMemoryBarrierWithGroupSync();
+        gsScan[tid] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (i < _CTTileParams.z)
+        _CTTileOffset[i] = gsScan[tid] - v;
+    if (tid == CT_SCAN_GROUP - 1)
+        _CTBlockSums[gid.x] = gsScan[tid];
+}
+
+// Turns the block totals into block base offsets. One group walks all blocks, so this
+// works for any screen size instead of being capped at CT_SCAN_GROUP blocks.
+[numthreads(CT_SCAN_GROUP, 1, 1)]
+void CSScanBlockSums(uint tid : SV_GroupIndex)
+{
+    uint blockCount = _CTTileParams.w;
+    uint chunk = (blockCount + CT_SCAN_GROUP - 1) / CT_SCAN_GROUP;
+    uint start = tid * chunk;
+
+    uint sum = 0;
+    for (uint j = 0; j < chunk; j++)
+    {
+        uint idx = start + j;
+        if (idx < blockCount)
+            sum += _CTBlockSums[idx];
+    }
+
+    gsScan[tid] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint offset = 1; offset < CT_SCAN_GROUP; offset <<= 1)
+    {
+        uint add = (tid >= offset) ? gsScan[tid - offset] : 0;
+        GroupMemoryBarrierWithGroupSync();
+        gsScan[tid] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    uint run = gsScan[tid] - sum;
+    for (uint k = 0; k < chunk; k++)
+    {
+        uint idx = start + k;
+        if (idx < blockCount)
+        {
+            uint v = _CTBlockSums[idx];
+            _CTBlockSums[idx] = run;
+            run += v;
+        }
+    }
+}
+
+[numthreads(CT_SCAN_GROUP, 1, 1)]
+void CSScanAdd(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CTTileParams.z)
+        return;
+    _CTTileOffset[i] += _CTBlockSums[i / CT_SCAN_GROUP];
+}
+
+// Writes triangle indices into the pool. Slots are handed out atomically, so the tile
+// list comes out unordered; the raster kernel sorts it before shading.
+[numthreads(64, 1, 1)]
+void CSScatter(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CTTriCount)
+        return;
+
+    uint2 tileLo, tileHi;
+    if (!TriTileRange(_CTTriangles[i], tileLo, tileHi))
+        return;
+
+    for (uint ty = tileLo.y; ty <= tileHi.y; ty++)
+    {
+        uint row = ty * _CTTileParams.x;
+        for (uint tx = tileLo.x; tx <= tileHi.x; tx++)
+        {
+            uint tile = row + tx;
+            uint capacity = min(_CTTileCount[tile], CT_MAX_TILE_PRIMS);
+            uint slot;
+            InterlockedAdd(_CTTileCursor[tile], 1, slot);
+            if (slot >= capacity)
+                continue;
+
+            uint dst = _CTTileOffset[tile] + slot;
+            if (dst < _CTTileListCapacity)
+                _CTTileList[dst] = i;
+        }
+    }
+}

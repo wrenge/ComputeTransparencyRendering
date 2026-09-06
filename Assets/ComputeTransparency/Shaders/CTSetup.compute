@@ -1,0 +1,130 @@
+// Turns the depth sorted sprite list into screen space triangles.
+// Culled sprites keep their slot (with valid = 0) so that triangle index order stays
+// identical to depth order, which every later stage relies on.
+#pragma kernel CSSetup
+
+#include "CTCommon.hlsl"
+
+StructuredBuffer<CTSpriteInstance> _CTInstances;
+// Instance indices in front to back order. Sorting indices instead of the instances keeps the
+// instance upload a plain block copy on the CPU side.
+StructuredBuffer<uint>            _CTSortedIndices;
+RWStructuredBuffer<CTTri>         _CTTriangles;
+
+float4x4 _CTViewProj;      // GPU projection * view, so z comes out in device depth range
+float4   _CTScreenSize;    // xy = pixels, zw = 1/pixels
+float4   _CTClipZParams;   // x = scale, y = bias mapping clip z to [0,1] device depth
+float2   _CTAtlasSize;     // atlas texel size, used for the mip selection
+float4   _CTCameraRight;   // xyz, world space
+float4   _CTCameraUp;      // xyz, world space
+uint     _CTSpriteCount;
+
+void EmitTri(uint index, float2 p0, float2 p1, float2 p2,
+             float2 uv0, float2 uv1, float2 uv2,
+             float z0, float z1, float z2,
+             uint color, uint slice, float lod, uint valid)
+{
+    CTTri t;
+    t.p01 = float4(p0, p1);
+    t.p2uv0 = float4(p2, uv0);
+    t.uv12 = float4(uv1, uv2);
+    t.zLod = float4(z0, z1, z2, lod);
+    t.payload = uint4(color, slice, valid, 0);
+    _CTTriangles[index] = t;
+}
+
+// The uv mapping is affine in screen space, so one mip level per triangle is enough.
+float TriangleLod(float2 p0, float2 p1, float2 p2, float2 uv0, float2 uv1, float2 uv2)
+{
+    float2 e1 = p1 - p0, e2 = p2 - p0;
+    float2 d1 = uv1 - uv0, d2 = uv2 - uv0;
+    float det = e1.x * e2.y - e1.y * e2.x;
+    if (abs(det) < 1e-8)
+        return 0.0;
+
+    float invDet = 1.0 / det;
+    float2 duvdx = (d1 * e2.y - d2 * e1.y) * invDet;
+    float2 duvdy = (d2 * e1.x - d1 * e2.x) * invDet;
+
+    float2 tx = duvdx * _CTAtlasSize;
+    float2 ty = duvdy * _CTAtlasSize;
+    float rho = max(dot(tx, tx), dot(ty, ty));
+    return 0.5 * log2(max(rho, 1e-8));
+}
+
+[numthreads(64, 1, 1)]
+void CSSetup(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CTSpriteCount)
+        return;
+
+    CTSpriteInstance s = _CTInstances[_CTSortedIndices[i]];
+
+    float3 center = s.center.xyz;
+    uint color = s.payload.x;
+    uint slice = s.payload.y;
+
+    float3 axisX, axisY;
+    if (s.payload.z & CT_FLAG_BILLBOARD)
+    {
+        // Orienting billboards here rather than on the CPU is what lets a batch that does not
+        // move cost nothing per frame: the instance data no longer depends on the camera.
+        float sinRoll, cosRoll;
+        sincos(s.center.w, sinRoll, cosRoll);
+        float3 right = _CTCameraRight.xyz;
+        float3 up = _CTCameraUp.xyz;
+        axisX = ( cosRoll * right + sinRoll * up) * s.axisX.w;
+        axisY = (-sinRoll * right + cosRoll * up) * s.axisY.w;
+    }
+    else
+    {
+        axisX = s.axisX.xyz;
+        axisY = s.axisY.xyz;
+    }
+
+    float3 corner[4];
+    corner[0] = center - axisX - axisY;
+    corner[1] = center + axisX - axisY;
+    corner[2] = center + axisX + axisY;
+    corner[3] = center - axisX + axisY;
+
+    float2 uv[4];
+    uv[0] = s.uvRect.xy;
+    uv[1] = s.uvRect.xy + float2(s.uvRect.z, 0);
+    uv[2] = s.uvRect.xy + s.uvRect.zw;
+    uv[3] = s.uvRect.xy + float2(0, s.uvRect.w);
+
+    float2 sp[4];
+    float  sz[4];
+    uint valid = 1;
+
+    [unroll]
+    for (uint k = 0; k < 4; k++)
+    {
+        float4 clip = mul(_CTViewProj, float4(corner[k], 1.0));
+        // Near plane clipping is not implemented: a quad with any vertex behind the eye is
+        // dropped whole. Sprites are small relative to the near plane so this is acceptable.
+        if (clip.w <= 1e-5)
+            valid = 0;
+
+        float invW = 1.0 / max(clip.w, 1e-5);
+        float3 ndc = clip.xyz * invW;
+        sp[k] = (ndc.xy * 0.5 + 0.5) * _CTScreenSize.xy;
+        sz[k] = ndc.z * _CTClipZParams.x + _CTClipZParams.y;
+    }
+
+    // Fully offscreen quads are dropped here so binning never has to look at them.
+    float2 lo = min(min(sp[0], sp[1]), min(sp[2], sp[3]));
+    float2 hi = max(max(sp[0], sp[1]), max(sp[2], sp[3]));
+    if (any(hi < 0.0) || any(lo > _CTScreenSize.xy))
+        valid = 0;
+
+    float lod = TriangleLod(sp[0], sp[1], sp[2], uv[0], uv[1], uv[2]);
+
+    uint baseIndex = i * 2;
+    EmitTri(baseIndex + 0, sp[0], sp[1], sp[2], uv[0], uv[1], uv[2], sz[0], sz[1], sz[2],
+            color, slice, lod, valid);
+    EmitTri(baseIndex + 1, sp[0], sp[2], sp[3], uv[0], uv[2], uv[3], sz[0], sz[2], sz[3],
+            color, slice, lod, valid);
+}

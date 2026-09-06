@@ -1,0 +1,225 @@
+// Least significant digit radix sort of (depth key, instance index) pairs, four passes of
+// eight bits. The result is the instance index list the setup kernel walks, in front to back
+// order, without the CPU ever touching a sprite.
+//
+// The scatter pass has to be stable: an LSD radix sort relies on equal digits keeping the
+// order the previous pass established. Handing out slots with atomics would not be, so each
+// block sorts its own chunk locally first, with eight one-bit splits, and derives every
+// element's rank from its position in that locally sorted chunk.
+#pragma kernel CSPrepare
+#pragma kernel CSCount
+#pragma kernel CSScanBlocks
+#pragma kernel CSScanBlockSums
+#pragma kernel CSScanAdd
+#pragma kernel CSScatter
+
+#include "CTCommon.hlsl"
+
+#define CT_RADIX_BITS 8
+#define CT_RADIX (1 << CT_RADIX_BITS)
+#define CT_RADIX_MASK (CT_RADIX - 1)
+#define CT_SORT_GROUP 256          // threads per block, and elements per block
+#define CT_SORT_SCAN_GROUP 256
+
+StructuredBuffer<CTSpriteInstance> _CTInstances;
+
+RWStructuredBuffer<uint> _CTSortKeysIn;
+RWStructuredBuffer<uint> _CTSortValuesIn;
+RWStructuredBuffer<uint> _CTSortKeysOut;
+RWStructuredBuffer<uint> _CTSortValuesOut;
+RWStructuredBuffer<uint> _CTSortHistogram;   // [digit * blockCount + block], scanned in place
+RWStructuredBuffer<uint> _CTSortBlockSums;
+
+float4 _CTSortCameraPosition;   // xyz
+float4 _CTSortCameraForward;    // xyz
+uint   _CTSortInstanceCount;    // real instances
+uint   _CTSortPaddedCount;      // rounded up to a whole number of blocks
+uint   _CTSortBlockCount;
+uint   _CTSortShift;            // bit offset of the digit this pass sorts on
+uint   _CTSortHistogramSize;    // CT_RADIX * blockCount
+
+groupshared uint gsKeys[CT_SORT_GROUP];
+groupshared uint gsValues[CT_SORT_GROUP];
+groupshared uint gsScan[CT_SORT_GROUP];
+groupshared uint gsDigitStart[CT_RADIX];
+groupshared uint gsTotalZeros;
+
+// Maps a float onto a uint whose unsigned ordering matches the float's ordering: flip the sign
+// bit for positives, every bit for negatives.
+uint FloatToSortableUint(float f)
+{
+    uint u = asuint(f);
+    uint mask = (u & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
+    return u ^ mask;
+}
+
+// Inclusive Hillis-Steele scan of gsScan across the group. Every loop bound is a compile time
+// constant, which is what keeps the barriers out of thread varying control flow.
+void ScanGroupInclusive(uint tid)
+{
+    for (uint offset = 1; offset < CT_SORT_GROUP; offset <<= 1)
+    {
+        uint add = (tid >= offset) ? gsScan[tid - offset] : 0;
+        GroupMemoryBarrierWithGroupSync();
+        gsScan[tid] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+[numthreads(CT_SORT_GROUP, 1, 1)]
+void CSPrepare(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CTSortPaddedCount)
+        return;
+
+    if (i < _CTSortInstanceCount)
+    {
+        float3 centre = _CTInstances[i].center.xyz;
+        float depth = dot(centre - _CTSortCameraPosition.xyz, _CTSortCameraForward.xyz);
+        _CTSortKeysIn[i] = FloatToSortableUint(depth);
+        _CTSortValuesIn[i] = i;
+    }
+    else
+    {
+        // Padding sorts to the end, where nothing reads it.
+        _CTSortKeysIn[i] = 0xFFFFFFFFu;
+        _CTSortValuesIn[i] = 0xFFFFFFFFu;
+    }
+}
+
+// Per block digit histogram. Each (digit, block) cell has exactly one writer, so the buffer
+// needs no clearing between passes.
+[numthreads(CT_SORT_GROUP, 1, 1)]
+void CSCount(uint3 groupId : SV_GroupID, uint tid : SV_GroupIndex)
+{
+    gsDigitStart[tid] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint index = groupId.x * CT_SORT_GROUP + tid;
+    uint digit = (_CTSortKeysIn[index] >> _CTSortShift) & CT_RADIX_MASK;
+    uint ignored;
+    InterlockedAdd(gsDigitStart[digit], 1, ignored);
+    GroupMemoryBarrierWithGroupSync();
+
+    _CTSortHistogram[tid * _CTSortBlockCount + groupId.x] = gsDigitStart[tid];
+}
+
+[numthreads(CT_SORT_SCAN_GROUP, 1, 1)]
+void CSScanBlocks(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint tid : SV_GroupIndex)
+{
+    uint i = id.x;
+    uint v = (i < _CTSortHistogramSize) ? _CTSortHistogram[i] : 0;
+    gsScan[tid] = v;
+    GroupMemoryBarrierWithGroupSync();
+    ScanGroupInclusive(tid);
+
+    if (i < _CTSortHistogramSize)
+        _CTSortHistogram[i] = gsScan[tid] - v;
+    if (tid == CT_SORT_SCAN_GROUP - 1)
+        _CTSortBlockSums[gid.x] = gsScan[tid];
+}
+
+// One group walks every block sum, so this works at any size instead of being capped at one
+// group's worth of blocks.
+[numthreads(CT_SORT_SCAN_GROUP, 1, 1)]
+void CSScanBlockSums(uint tid : SV_GroupIndex)
+{
+    uint sumCount = (_CTSortHistogramSize + CT_SORT_SCAN_GROUP - 1) / CT_SORT_SCAN_GROUP;
+    uint chunk = (sumCount + CT_SORT_SCAN_GROUP - 1) / CT_SORT_SCAN_GROUP;
+    uint start = tid * chunk;
+
+    uint sum = 0;
+    for (uint j = 0; j < chunk; j++)
+    {
+        uint idx = start + j;
+        if (idx < sumCount)
+            sum += _CTSortBlockSums[idx];
+    }
+
+    gsScan[tid] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    ScanGroupInclusive(tid);
+
+    uint run = gsScan[tid] - sum;
+    for (uint k = 0; k < chunk; k++)
+    {
+        uint idx = start + k;
+        if (idx < sumCount)
+        {
+            uint v = _CTSortBlockSums[idx];
+            _CTSortBlockSums[idx] = run;
+            run += v;
+        }
+    }
+}
+
+[numthreads(CT_SORT_SCAN_GROUP, 1, 1)]
+void CSScanAdd(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CTSortHistogramSize)
+        return;
+    _CTSortHistogram[i] += _CTSortBlockSums[i / CT_SORT_SCAN_GROUP];
+}
+
+[numthreads(CT_SORT_GROUP, 1, 1)]
+void CSScatter(uint3 groupId : SV_GroupID, uint tid : SV_GroupIndex)
+{
+    uint index = groupId.x * CT_SORT_GROUP + tid;
+    gsKeys[tid] = _CTSortKeysIn[index];
+    gsValues[tid] = _CTSortValuesIn[index];
+    GroupMemoryBarrierWithGroupSync();
+
+    // Sort the block's chunk by this pass's digit, one bit at a time. Zeros keep their
+    // relative order and so do ones, which is what makes the whole radix sort stable.
+    for (uint bit = 0; bit < CT_RADIX_BITS; bit++)
+    {
+        uint digit = (gsKeys[tid] >> _CTSortShift) & CT_RADIX_MASK;
+        uint one = (digit >> bit) & 1u;
+
+        gsScan[tid] = 1u - one;
+        GroupMemoryBarrierWithGroupSync();
+        ScanGroupInclusive(tid);
+
+        uint zerosUpToHere = gsScan[tid];
+        if (tid == CT_SORT_GROUP - 1)
+            gsTotalZeros = gsScan[tid];
+        GroupMemoryBarrierWithGroupSync();
+
+        uint zerosBefore = zerosUpToHere - (1u - one);
+        uint onesBefore = tid - zerosBefore;
+        uint destination = one ? (gsTotalZeros + onesBefore) : zerosBefore;
+
+        uint key = gsKeys[tid];
+        uint value = gsValues[tid];
+        GroupMemoryBarrierWithGroupSync();
+        gsKeys[destination] = key;
+        gsValues[destination] = value;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Where each digit's run starts inside the locally sorted chunk.
+    gsDigitStart[tid] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint myDigit = (gsKeys[tid] >> _CTSortShift) & CT_RADIX_MASK;
+    uint ignored;
+    InterlockedAdd(gsDigitStart[myDigit], 1, ignored);
+    GroupMemoryBarrierWithGroupSync();
+
+    gsScan[tid] = gsDigitStart[tid];
+    GroupMemoryBarrierWithGroupSync();
+    ScanGroupInclusive(tid);
+    uint runStart = gsScan[tid] - gsDigitStart[tid];
+    GroupMemoryBarrierWithGroupSync();
+    gsDigitStart[tid] = runStart;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint rankInDigit = tid - gsDigitStart[myDigit];
+    uint destinationIndex = _CTSortHistogram[myDigit * _CTSortBlockCount + groupId.x] + rankInDigit;
+    if (destinationIndex < _CTSortPaddedCount)
+    {
+        _CTSortKeysOut[destinationIndex] = gsKeys[tid];
+        _CTSortValuesOut[destinationIndex] = gsValues[tid];
+    }
+}
