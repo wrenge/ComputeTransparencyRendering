@@ -19,5 +19,7 @@
         <ui:DropdownField name="debug" label="Debug" index="0" class="ct-control" />
 
         <ui:Button name="reset" text="Reset" class="ct-reset" />
+
+        <ui:Label name="device" text="" class="ct-device" />
     </ui:VisualElement>
 </ui:UXML>

@@ -34,8 +34,10 @@ Shader "ComputeTransparency/Reference Sprite"
 
             HLSLPROGRAM
             // Texture2DArray needs this, and so does instancing: UnityInstancing.hlsl gates its
-            // support on SHADER_TARGET, and the default target is below the bar.
-            #pragma target 4.5
+            // support on SHADER_TARGET, and the default target is below the bar. 3.5 is the bar
+            // for both, and asking for more would drop the shader on any device that falls back
+            // to GLES3.0, where it silently renders nothing.
+            #pragma target 3.5
             #pragma vertex Vert
             #pragma fragment Frag
             #pragma require 2darray

@@ -153,18 +153,32 @@ namespace ComputeTransparency
         /// <summary>Bounds handed to the renderer. Per instance culling is not done, so this covers everything.</summary>
         public Bounds WorldBounds { get; set; } = new Bounds(Vector3.zero, Vector3.one * 10000f);
 
-        public void SetMaterial(Shader shader, CTAtlas atlas)
+        /// <summary>
+        /// Points the batch at a material asset. It is copied, not used directly, because the
+        /// atlas is built at load time and writing it onto the shared asset would dirty it.
+        /// </summary>
+        /// <remarks>
+        /// A material <em>asset</em> rather than just a shader, and this matters in a build. The
+        /// default shader stripping setting drops every INSTANCING_ON variant that no material in
+        /// the build asks for, and a material created at runtime is invisible to the stripper. The
+        /// variant then does not exist on the device, the instanced draw has nothing to run, and
+        /// the whole batch renders nothing while the editor looks perfect. Shipping the material as
+        /// an asset with GPU instancing ticked is what keeps the variant.
+        /// </remarks>
+        public void SetMaterial(Material template, CTAtlas atlas)
         {
-            if (shader == null)
+            if (template == null)
                 return;
 
-            if (m_Material == null || m_Material.shader != shader)
+            if (m_Material == null || m_Material.shader != template.shader)
             {
                 CoreUtils.Destroy(m_Material);
-                m_Material = new Material(shader) { name = Name, hideFlags = HideFlags.DontSave };
-                // Without this the draw falls back to one submission per sprite.
-                m_Material.enableInstancing = true;
+                m_Material = new Material(template) { name = Name, hideFlags = HideFlags.DontSave };
             }
+
+            // Copied materials inherit the flag, but a template saved without it would leave the
+            // batch drawing one sprite per submission, so it is not left to chance.
+            m_Material.enableInstancing = true;
 
             if (atlas != null)
                 m_Material.SetTexture("_BaseMap", atlas.Texture);

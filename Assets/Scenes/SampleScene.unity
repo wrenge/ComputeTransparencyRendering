@@ -591,7 +591,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: ComputeTransparency.Runtime::ComputeTransparency.CTStressScene
   atlas: {fileID: 11400000, guid: bc068e8d1377c4665a2185e8fd0c41da, type: 2}
-  referenceShader: {fileID: 4800000, guid: aa6a629065f0c43eb9a7c5dfaf373503, type: 3}
+  referenceMaterial: {fileID: 2100000, guid: 4803d7928a81142f492ecc7b62b81cd9, type: 2}
   count: 10000
   extents: {x: 8, y: 5, z: 20}
   sizeRange: {x: 0.6, y: 1.6}

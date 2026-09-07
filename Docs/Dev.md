@@ -957,3 +957,66 @@ rather than of the scene.
 In the demo the Debug dropdown now stays enabled on the traditional path. Overdraw is the one view
 both renderers can produce; Transmittance, Tile load and Walk length describe the compute
 rasterizer's tiles and its early-out, so they do nothing while the hardware path is showing.
+
+## Work log — the first Android build
+
+Three failures at once on a Galaxy S23 (Vulkan): the frame rate pinned at 30, the compute path
+drawing untextured sprites, and the traditional path drawing nothing at all. Two of them have
+identified causes and fixes; the third is instrumented rather than guessed at.
+
+### The frame rate was the platform's, not the renderer's
+
+A player that never asks for a frame rate gets the platform's answer, and on Android that is 30.
+On top of that the quality level the demo ships on has vSync on, and Optimized Frame Pacing
+(Swappy) was enabled in the player settings, which paces the player to divisors of the display
+refresh. All three had to go for the number on screen to describe the renderer:
+`CTDemoBootstrap` sets `QualitySettings.vSyncCount = 0` and `Application.targetFrameRate` (300 by
+default, exposed on the component), and `optimizedFramePacing` is off in the player settings.
+
+### The traditional path had no instanced variant to run
+
+The default shader stripping setting is Strip Unused for instancing variants, and "unused" means
+"no material asset in the build has GPU Instancing ticked". Every material in this project was
+created at runtime from a `Shader` reference, which the stripper cannot see, so `INSTANCING_ON`
+did not exist on the device. `Graphics.RenderMeshInstanced` then had nothing to run and the whole
+batch drew nothing, while the editor - which compiles variants on demand - looked perfect.
+
+The fix is the ordinary one: ship `CTReferenceSprite.mat` as an asset with instancing enabled and
+copy it at runtime. `CTInstancedSpriteBatch.SetMaterial` now takes a `Material` rather than a
+`Shader`, and `CTDemoCloud` and `CTStressScene` reference the material.
+
+Second fix in the same area: `#pragma target 4.5` is more than this shader needs and drops it
+entirely on any device that falls back to GLES3.0, which reports shader level 35. The instancing
+gate in `UnityInstancing.hlsl` and `Texture2DArray` both sit at 3.5, so that is what it asks for
+now. The Android graphics API list is Vulkan then GLES3, so this only bites on the fallback - but
+it bites silently, which is the worst kind. Re-measured in the editor after the change: compute
+against traditional, mean 0.000439 / 0.002345 / 0.004236 / 0.004476 at 100 / 1000 / 5000 / 10000,
+unchanged from 4.5.
+
+### The untextured compute sprites are not diagnosed
+
+No device here to attach to, and the atlas is packed at load time from the project's textures, so
+the failure could be the pack, the binding, or the sampling. Rather than guess, the packing now
+says what it did and the demo shows the facts on screen.
+
+`CTAtlas.Build` no longer calls `Apply` after `Graphics.CopyTexture`. The copy is GPU side; the
+array's CPU side is still the zeroes it was allocated with, and uploading those over a completed
+copy is at best a waste and at worst the whole bug. `Apply` now runs only on the path that
+actually writes CPU data. That path is new: `Graphics.CopyTexture` from a `Texture2D` to a
+`Texture2DArray` is a copy between texture types, which not every device supports, so where
+`copyTextureSupport` lacks `DifferentTypes` the raw bytes are uploaded instead - and where the
+source is also not readable, the log says exactly which of the two is missing rather than leaving a
+black atlas on a device nobody can attach a debugger to. A slice that fails the size and format
+match, and an atlas that packs nothing at all, now log as well.
+
+The panel carries a device report - graphics API and shader level, screen size, frame rate cap and
+vSync, compute and instancing support, `copyTextureSupport`, the atlas's actual dimensions, format
+and mip count, and whether the sprite shader is supported and instanced. Every line in it picks
+between causes that are otherwise indistinguishable on a phone.
+
+The next measurement is on the device, and it is one comparison: with the traditional path now
+drawing, does it show textures? Both paths sample the same `Texture2DArray`. If both are
+untextured the atlas is the problem and the report says which failure it hit; if only the compute
+path is, the fault is in how the compute pass binds the array, which it does on the ComputeShader
+asset rather than through the command buffer because importing the array as an RTHandle binds it
+as a plain 2D target and the array sampler comes back empty.

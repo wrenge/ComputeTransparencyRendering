@@ -23,8 +23,9 @@ namespace ComputeTransparency
         [Tooltip("Atlas both paths sample. The compute feature must be pointed at the same asset.")]
         public CTAtlas atlas;
 
-        [Tooltip("Shader for the traditional group. Expects ComputeTransparency/Reference Sprite.")]
-        public Shader referenceShader;
+        [Tooltip("Material for the traditional group. Expects CTReferenceSprite.mat, which must " +
+                 "have GPU instancing enabled so the build keeps the instanced shader variant.")]
+        public Material referenceMaterial;
 
         [Min(0)] public int count = 4000;
         public Vector3 extents = new Vector3(8f, 5f, 20f);
@@ -145,7 +146,7 @@ namespace ComputeTransparency
         void BuildTraditionalGroup()
         {
             m_Traditional = new CTInstancedSpriteBatch(Mathf.Max(m_Count, 1), "CT Stress Traditional");
-            m_Traditional.SetMaterial(referenceShader, atlas);
+            m_Traditional.SetMaterial(referenceMaterial, atlas);
 
             var instances = m_Traditional.Instances;
             for (int i = 0; i < m_Count; i++)

@@ -129,6 +129,7 @@ GameObject:
   m_Component:
   - component: {fileID: 433464632}
   - component: {fileID: 433464631}
+  - component: {fileID: 433464633}
   m_Layer: 0
   m_Name: Sprite Cloud
   m_TagString: Untagged
@@ -149,7 +150,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: ComputeTransparency.Demo::ComputeTransparency.Demo.CTDemoCloud
   atlas: {fileID: 11400000, guid: bc068e8d1377c4665a2185e8fd0c41da, type: 2}
-  instancedShader: {fileID: 4800000, guid: aa6a629065f0c43eb9a7c5dfaf373503, type: 3}
+  instancedMaterial: {fileID: 2100000, guid: 4803d7928a81142f492ecc7b62b81cd9, type: 2}
   countLadder: 64000000e8030000881300001027000050c30000a086010020a1070040420f00
   startStep: 3
   radius: 11
@@ -174,6 +175,19 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &433464633
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 433464630}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a5d711a16daa44e2db5eaf34936b8bc2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: ComputeTransparency.Demo::ComputeTransparency.Demo.CTDemoBootstrap
+  targetFrameRate: 300
 --- !u!1 &480212795
 GameObject:
   m_ObjectHideFlags: 0

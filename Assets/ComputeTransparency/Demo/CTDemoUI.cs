@@ -120,6 +120,10 @@ namespace ComputeTransparency.Demo
                     Sync();
                 };
 
+            var device = root.Q<Label>("device");
+            if (device != null)
+                device.text = CTDemoBootstrap.DeviceReport(cloud);
+
             cloud.Changed += Sync;
             ApplyDebugMode();
             Sync();

@@ -72,3 +72,12 @@
     min-width: 78px;
     color: rgb(199, 204, 214);
 }
+
+/* Device facts. Small and quiet: it is only read when a build misbehaves, and on a phone there
+   is no console to read instead. */
+.ct-device {
+    margin-top: 10px;
+    font-size: 10px;
+    color: rgb(140, 148, 162);
+    white-space: normal;
+}

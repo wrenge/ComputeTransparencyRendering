@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace ComputeTransparency
 {
@@ -68,12 +69,21 @@ namespace ComputeTransparency
                 return;
 
             // Mip count has to match the slices exactly for Graphics.CopyTexture to accept them.
+            bool uploaded = false;
+
             m_Array = new Texture2DArray(first.width, first.height, m_Textures.Count, first.format, first.mipmapCount > 1)
             {
                 name = name + " (Array)",
                 filterMode = first.filterMode,
                 wrapMode = TextureWrapMode.Clamp
             };
+
+            // Texture2D to Texture2DArray is a copy between different texture types, which not
+            // every device allows. Where it is missing the raw bytes are uploaded instead, which
+            // needs the source marked readable - so say which of the two is unavailable rather
+            // than leaving a silently black atlas on a device nobody can attach a debugger to.
+            bool canCopy = (SystemInfo.copyTextureSupport & CopyTextureSupport.DifferentTypes) != 0;
+            int copied = 0;
 
             for (int i = 0; i < m_Textures.Count; i++)
             {
@@ -85,14 +95,42 @@ namespace ComputeTransparency
                     t.mipmapCount != first.mipmapCount)
                 {
                     Debug.LogError($"[ComputeTransparency] Atlas '{name}' slice {i} ('{t.name}') does not match " +
-                                   $"the first slice ({first.width}x{first.height}, {first.format}). Skipped.", this);
+                                   $"the first slice ({first.width}x{first.height}, {first.format}, " +
+                                   $"{first.mipmapCount} mips). It is {t.width}x{t.height}, {t.format}, " +
+                                   $"{t.mipmapCount} mips. Skipped - that slice will sample black.", this);
                     continue;
                 }
 
-                Graphics.CopyTexture(t, 0, m_Array, i);
+                if (canCopy)
+                {
+                    Graphics.CopyTexture(t, 0, m_Array, i);
+                    copied++;
+                }
+                else if (t.isReadable)
+                {
+                    for (int mip = 0; mip < t.mipmapCount; mip++)
+                        m_Array.SetPixelData(t.GetPixelData<byte>(mip), mip, i);
+                    copied++;
+                    uploaded = true;
+                }
+                else
+                {
+                    Debug.LogError($"[ComputeTransparency] Atlas '{name}' cannot be packed on this device: " +
+                                   $"Graphics.CopyTexture does not support copying between texture types " +
+                                   $"(copyTextureSupport = {SystemInfo.copyTextureSupport}) and slice {i} " +
+                                   $"('{t.name}') is not readable. Enable Read/Write on the source textures.", this);
+                }
             }
 
-            m_Array.Apply(false, false);
+            // Only when the pixels came in through the CPU side: after Graphics.CopyTexture the
+            // data is already on the GPU and there is nothing to upload, while the texture's CPU
+            // side is still the zeroes it was allocated with.
+            if (uploaded)
+                m_Array.Apply(false, false);
+
+            if (copied == 0)
+                Debug.LogError($"[ComputeTransparency] Atlas '{name}' packed no slices; everything " +
+                               $"sampling it will come out black.", this);
         }
 
         void OnDisable()

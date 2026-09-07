@@ -43,8 +43,10 @@ namespace ComputeTransparency.Demo
         [Tooltip("Atlas both paths sample. The compute feature must be pointed at the same asset.")]
         public CTAtlas atlas;
 
-        [Tooltip("Shader for the hardware path. Expects ComputeTransparency/Reference Sprite.")]
-        public Shader instancedShader;
+        [Tooltip("Material for the hardware path. Expects CTReferenceSprite.mat, which must have " +
+                 "GPU instancing enabled: a runtime created material is invisible to shader " +
+                 "variant stripping and the instanced variant is then missing from the build.")]
+        public Material instancedMaterial;
 
         [Tooltip("Instance counts the -/+ buttons step through. The largest one sets the allocation.")]
         public int[] countLadder = { 100, 1000, 5000, 10_000, 50_000, 100_000, 500_000, 1_000_000 };
@@ -210,7 +212,7 @@ namespace ComputeTransparency.Demo
             m_Items = new NativeArray<Item>(capacity, Allocator.Persistent);
             m_Compute = new CTSpriteBatch(capacity, "CT Demo Cloud");
             m_Traditional = new CTInstancedSpriteBatch(capacity, "CT Demo Cloud (Hardware)");
-            m_Traditional.SetMaterial(instancedShader, atlas);
+            m_Traditional.SetMaterial(instancedMaterial, atlas);
             m_Traditional.Overdraw = m_Overdraw;
             m_Traditional.WorldBounds = new Bounds(transform.position, Vector3.one * (radius * 4f));
             m_Generated = 0;
