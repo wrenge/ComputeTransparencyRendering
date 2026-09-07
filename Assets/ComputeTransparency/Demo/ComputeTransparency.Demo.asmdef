@@ -1,7 +1,8 @@
 {
-    "name": "ComputeTransparency.Runtime",
-    "rootNamespace": "ComputeTransparency",
+    "name": "ComputeTransparency.Demo",
+    "rootNamespace": "ComputeTransparency.Demo",
     "references": [
+        "ComputeTransparency.Runtime",
         "Unity.RenderPipelines.Core.Runtime",
         "Unity.RenderPipelines.Universal.Runtime",
         "Unity.Burst",

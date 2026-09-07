@@ -18,8 +18,10 @@
 
 StructuredBuffer<CTTri> _CTTriangles;
 StructuredBuffer<uint>  _CTTileList;
-StructuredBuffer<uint>  _CTTileCount;
-StructuredBuffer<uint>  _CTTileOffset;
+StructuredBuffer<uint>  _CTTileCount;      // raw overlap count, for the debug views only
+StructuredBuffer<uint>  _CTTileEnd;        // one past the tile's last slot in the pool
+StructuredBuffer<uint>  _CTTileSegCount;   // kept count per (tile, segment)
+StructuredBuffer<uint>  _CTTileSegBase;    // absolute start of the (tile, segment) sub-slice
 
 Texture2DArray _CTAtlas;
 SamplerState   sampler_CTAtlas;
@@ -34,8 +36,9 @@ uint   _CTDepthTestEnabled;
 float  _CTEpsilon;        // transmittance cutoff, from the renderer feature
 uint   _CTDebugMode;      // CT_DEBUG_*, from the renderer feature
 float  _CTDebugRange;     // count mapped to the top of the heat ramp
+uint   _CTSegmentCount;   // active segments, 1 .. CT_MAX_SEGMENTS
 
-groupshared uint gsList[CT_MAX_TILE_PRIMS];
+groupshared uint gsList[CT_MAX_SEG_PRIMS];
 groupshared uint gsAlive;
 
 float Cross2(float2 a, float2 b)
@@ -73,7 +76,7 @@ bool EdgeAccept(float w, float2 dir)
 
 // What the debug views draw. Alpha is written as 0 by the caller so the composite pass
 // replaces the frame rather than blending over it.
-float3 DebugColor(uint shaded, float transmittance, uint rawCount, uint walked)
+float3 DebugColor(uint shaded, float transmittance, uint rawCount, uint kept, uint walked)
 {
     // Single exit: the metal compiler warns about the value being potentially uninitialized
     // when the branches return directly.
@@ -96,8 +99,8 @@ float3 DebugColor(uint shaded, float transmittance, uint rawCount, uint walked)
     else
     {
         // Tile load: how many primitives binning put in this tile, before the early-out gets
-        // a say. Magenta means the tile went over CT_MAX_TILE_PRIMS and the surplus was dropped.
-        c = (rawCount > CT_MAX_TILE_PRIMS)
+        // a say. Magenta means the tile could not keep them all and dropped the surplus.
+        c = (rawCount > kept)
             ? float3(1.0, 0.0, 1.0)
             : CTHeat(rawCount / max(_CTDebugRange, 1.0));
     }
@@ -157,108 +160,149 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
     bool onScreen = all(pixel < (uint2)_CTScreenSize.xy);
 
     uint rawCount = _CTTileCount[tile];
-    uint count = min(rawCount, CT_MAX_TILE_PRIMS);
-    uint listBase = _CTTileOffset[tile];
+    uint tileEnd = _CTTileEnd[tile];
+    uint tileStart = tileEnd;   // overwritten by the first segment, whose base is the tile's
 
     float3 accum = 0.0;
     float  transmittance = 1.0;
     uint   shaded = 0;
     uint   walked = 0;
 
-    uint padded = NextPow2(count);
-    uint loadPasses = (padded + tileThreads - 1) / tileThreads;
-    for (uint p = 0; p < loadPasses; p++)
-    {
-        uint load = tid + p * tileThreads;
-        if (load < padded)
-            gsList[load] = (load < count) ? _CTTileList[listBase + load] : 0xFFFFFFFFu;
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    BitonicSortShared(padded, tid, tileThreads);
-
     float2 pt = (float2)pixel + 0.5;
     float sceneDepth = _CTDepthTestEnabled ? _CTSceneDepth.Load(int3(pixel, 0)) : 0.0;
 
-    // The walk is chunked so the outer loop bound is a compile time constant. A group sync
-    // inside a loop whose trip count comes from memory is rejected by the shader compilers,
-    // so the primitive count only ever guards work, never control flow around a sync.
-    const uint chunkCount = CT_MAX_TILE_PRIMS / CT_EARLY_OUT_STRIDE;
-    for (uint c = 0; c < chunkCount; c++)
+    // Segments are already in depth order, so they are walked in order and only the one being
+    // walked is sorted. The bound is a compile time constant; segments the feature is not using
+    // have a zero count and fall straight through, and the tile leaves the loop as soon as
+    // nothing is left to draw or every pixel has saturated.
+    for (uint seg = 0; seg < CT_MAX_SEGMENTS; seg++)
     {
-        for (uint k = 0; k < CT_EARLY_OUT_STRIDE; k++)
+        // The loop bound has to be a compile time constant because of the group syncs below,
+        // but the buffers are only sized for the segments actually in use, so anything past
+        // the last one reads nothing and falls through.
+        uint count = 0;
+        uint listBase = 0;
+        if (seg < _CTSegmentCount)
         {
-            uint i = c * CT_EARLY_OUT_STRIDE + k;
-            if (i >= count || transmittance < _CTEpsilon || !onScreen)
-                continue;
-
-            // Every lane in the group reads the same triangle, so this stays a uniform load.
-            CTTri t = _CTTriangles[gsList[i]];
-            float2 p0 = CTP0(t), p1 = CTP1(t), p2 = CTP2(t);
-            float2 uv0 = CTUV0(t), uv1 = CTUV1(t), uv2 = CTUV2(t);
-            float3 z = t.zLod.xyz;
-
-            float area = Cross2(p1 - p0, p2 - p0);
-            if (abs(area) <= 1e-6)
-                continue;
-
-            // Wind every triangle the same way rather than culling the back facing ones, so
-            // sprites stay two sided and the fill rule below has a consistent orientation.
-            if (area < 0.0)
-            {
-                float2 tp = p1; p1 = p2; p2 = tp;
-                float2 tuv = uv1; uv1 = uv2; uv2 = tuv;
-                float tz = z.y; z.y = z.z; z.z = tz;
-                area = -area;
-            }
-
-            float2 dir0, dir1, dir2;
-            float w0 = EdgeFunction(p1, p2, pt, dir0);
-            float w1 = EdgeFunction(p2, p0, pt, dir1);
-            float w2 = EdgeFunction(p0, p1, pt, dir2);
-            if (!EdgeAccept(w0, dir0) || !EdgeAccept(w1, dir1) || !EdgeAccept(w2, dir2))
-                continue;
-
-            float invArea = 1.0 / area;
-            float b0 = w0 * invArea;
-            float b1 = w1 * invArea;
-            float b2 = w2 * invArea;
-
-            if (_CTDepthTestEnabled)
-            {
-                float depth = dot(float3(b0, b1, b2), z);
-                bool occluded = _CTReversedZ ? (depth < sceneDepth) : (depth > sceneDepth);
-                if (occluded)
-                    continue;
-            }
-
-            float2 uv = b0 * uv0 + b1 * uv1 + b2 * uv2;
-            float4 texel = _CTAtlas.SampleLevel(sampler_CTAtlas, float3(uv, t.payload.y), t.zLod.w);
-            float4 src = texel * CTUnpackColor(t.payload.x);
-
-            accum += transmittance * src.a * src.rgb;
-            transmittance *= (1.0 - src.a);
-            // Counts the blends that actually happened, which is what the overdraw view is
-            // for: it stops climbing exactly where the early-out saved the work.
-            shaded++;
+            uint segIndex = tile * _CTSegmentCount + seg;
+            count = _CTTileSegCount[segIndex];
+            listBase = _CTTileSegBase[segIndex];
+            if (seg == 0)
+                tileStart = listBase;
         }
 
-        walked = min((c + 1) * CT_EARLY_OUT_STRIDE, count);
+        uint padded = NextPow2(count);
+        uint loadPasses = (padded + tileThreads - 1) / tileThreads;
+        for (uint p = 0; p < loadPasses; p++)
+        {
+            uint load = tid + p * tileThreads;
+            if (load < padded)
+                gsList[load] = (load < count) ? _CTTileList[listBase + load] : 0xFFFFFFFFu;
+        }
+        GroupMemoryBarrierWithGroupSync();
 
-        // Does any pixel in this tile still have transmittance left, and is there anything
-        // left to draw? If not the whole tile is done and the group abandons the walk.
+        BitonicSortShared(padded, tid, tileThreads);
+
+        uint segWalked = 0;
+
+        // The walk is chunked so the outer loop bound is a compile time constant. A group sync
+        // inside a loop whose trip count comes from memory is rejected by the shader compilers,
+        // so the primitive count only ever guards work, never control flow around a sync.
+        const uint chunkCount = CT_MAX_SEG_PRIMS / CT_EARLY_OUT_STRIDE;
+        for (uint c = 0; c < chunkCount; c++)
+        {
+            for (uint k = 0; k < CT_EARLY_OUT_STRIDE; k++)
+            {
+                uint i = c * CT_EARLY_OUT_STRIDE + k;
+                if (i >= count || transmittance < _CTEpsilon || !onScreen)
+                    continue;
+
+                // Every lane in the group reads the same triangle, so this stays a uniform load.
+                CTTri t = _CTTriangles[gsList[i]];
+                float2 p0 = CTP0(t), p1 = CTP1(t), p2 = CTP2(t);
+                float2 uv0 = CTUV0(t), uv1 = CTUV1(t), uv2 = CTUV2(t);
+                float3 z = t.zLod.xyz;
+
+                float area = Cross2(p1 - p0, p2 - p0);
+                if (abs(area) <= 1e-6)
+                    continue;
+
+                // Wind every triangle the same way rather than culling the back facing ones, so
+                // sprites stay two sided and the fill rule below has a consistent orientation.
+                if (area < 0.0)
+                {
+                    float2 tp = p1; p1 = p2; p2 = tp;
+                    float2 tuv = uv1; uv1 = uv2; uv2 = tuv;
+                    float tz = z.y; z.y = z.z; z.z = tz;
+                    area = -area;
+                }
+
+                float2 dir0, dir1, dir2;
+                float w0 = EdgeFunction(p1, p2, pt, dir0);
+                float w1 = EdgeFunction(p2, p0, pt, dir1);
+                float w2 = EdgeFunction(p0, p1, pt, dir2);
+                if (!EdgeAccept(w0, dir0) || !EdgeAccept(w1, dir1) || !EdgeAccept(w2, dir2))
+                    continue;
+
+                float invArea = 1.0 / area;
+                float b0 = w0 * invArea;
+                float b1 = w1 * invArea;
+                float b2 = w2 * invArea;
+
+                if (_CTDepthTestEnabled)
+                {
+                    float depth = dot(float3(b0, b1, b2), z);
+                    bool occluded = _CTReversedZ ? (depth < sceneDepth) : (depth > sceneDepth);
+                    if (occluded)
+                        continue;
+                }
+
+                float2 uv = b0 * uv0 + b1 * uv1 + b2 * uv2;
+                float4 texel = _CTAtlas.SampleLevel(sampler_CTAtlas, float3(uv, t.payload.y), t.zLod.w);
+                float4 src = texel * CTUnpackColor(t.payload.x);
+
+                accum += transmittance * src.a * src.rgb;
+                transmittance *= (1.0 - src.a);
+                // Counts the blends that actually happened, which is what the overdraw view is
+                // for: it stops climbing exactly where the early-out saved the work.
+                shaded++;
+            }
+
+            segWalked = min((c + 1) * CT_EARLY_OUT_STRIDE, count);
+
+            // Does any pixel in this tile still have transmittance left, and is there anything
+            // left to draw? If not the whole tile is done and the group abandons the walk.
+            if (tid == 0)
+                gsAlive = 0;
+            GroupMemoryBarrierWithGroupSync();
+
+            if (transmittance >= _CTEpsilon && onScreen && (c + 1) * CT_EARLY_OUT_STRIDE < count)
+                gsAlive = 1;
+            GroupMemoryBarrierWithGroupSync();
+
+            uint alive = gsAlive;
+            // The extra sync is what lets the compiler treat the break below as uniform.
+            GroupMemoryBarrierWithGroupSync();
+            if (alive == 0)
+                break;
+        }
+
+        walked += segWalked;
+
+        // Move on to the next segment only if some pixel can still take a contribution and this
+        // tile has primitives past the end of this segment. Both terms are group uniform.
         if (tid == 0)
             gsAlive = 0;
         GroupMemoryBarrierWithGroupSync();
 
-        if (transmittance >= _CTEpsilon && onScreen && (c + 1) * CT_EARLY_OUT_STRIDE < count)
+        bool moreLater = (seg + 1 < _CTSegmentCount) && ((listBase + count) < tileEnd);
+        if (transmittance >= _CTEpsilon && onScreen && moreLater)
             gsAlive = 1;
         GroupMemoryBarrierWithGroupSync();
 
-        uint alive = gsAlive;
-        // The extra sync is what lets the compiler treat the break below as uniform.
+        uint segAlive = gsAlive;
         GroupMemoryBarrierWithGroupSync();
-        if (alive == 0)
+        if (segAlive == 0)
             break;
     }
 
@@ -267,7 +311,7 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
         if (_CTDebugMode == CT_DEBUG_NONE)
             _CTResult[pixel] = float4(accum, transmittance);
         else
-            _CTResult[pixel] = float4(DebugColor(shaded, transmittance, rawCount, walked), 0.0);
+            _CTResult[pixel] = float4(DebugColor(shaded, transmittance, rawCount, tileEnd - tileStart, walked), 0.0);
     }
 }
 

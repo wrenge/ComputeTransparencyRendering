@@ -70,16 +70,18 @@ MonoBehaviour:
   m_Active: 1
   settings:
     atlas: {fileID: 11400000, guid: bc068e8d1377c4665a2185e8fd0c41da, type: 2}
-    tileSize: 8
-    averagePrimitivesPerTile: 512
+    tileSize: 16
+    binSegments: 4
+    averagePrimitivesPerTile: 1024
     depthTest: 1
-    epsilon: 0.003921569
-    sortMode: 0
+    epsilon: 0.075
+    sortMode: 1
     renderPassEvent: 450
     debugMode: 0
-    debugRange: 32
+    debugRange: 64
     setupShader: {fileID: 7200000, guid: ddade169b7e68488f87e46a2cc0b892c, type: 3}
     binShader: {fileID: 7200000, guid: 48d14b53d0e004e3e90b0bccae74b299, type: 3}
     rasterShader: {fileID: 7200000, guid: 2ee9557881bad448191e6ed290d9707f, type: 3}
     radixSortShader: {fileID: 7200000, guid: 630a91816b6874405a8071e364e02494, type: 3}
     compositeShader: {fileID: 4800000, guid: 94eba7ee94aa14f829cb97919f551f0f, type: 3}
+    traditionalOverdrawShader: {fileID: 4800000, guid: 3481e5f259f854a5bbe206326ba49246, type: 3}

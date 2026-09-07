@@ -1,3 +1,4 @@
+using Unity.Mathematics;
 using UnityEngine;
 
 namespace ComputeTransparency
@@ -49,8 +50,7 @@ namespace ComputeTransparency
         int m_Count;
 
         CTSpriteBatch m_Batch;
-        Transform m_TraditionalRoot;
-        CTReferenceSpriteBatch m_Reference;
+        CTInstancedSpriteBatch m_Traditional;
 
         Vector3 m_ComputeOffset;
 
@@ -59,6 +59,10 @@ namespace ComputeTransparency
         void OnEnable() => Rebuild();
 
         void OnDisable() => Clear();
+
+        // Immediate mode instanced drawing has to be re-issued every frame, and the depth sort
+        // inside it needs the camera where it will actually be when the frame renders.
+        void LateUpdate() => m_Traditional?.Render(Camera.main);
 
         void OnValidate()
         {
@@ -140,37 +144,52 @@ namespace ComputeTransparency
 
         void BuildTraditionalGroup()
         {
-            var go = new GameObject("Traditional Group", typeof(MeshFilter), typeof(MeshRenderer));
-            go.hideFlags = HideFlags.DontSave;
-            go.transform.SetParent(transform, false);
-            m_TraditionalRoot = go.transform;
+            m_Traditional = new CTInstancedSpriteBatch(Mathf.Max(m_Count, 1), "CT Stress Traditional");
+            m_Traditional.SetMaterial(referenceShader, atlas);
 
-            m_Reference = go.AddComponent<CTReferenceSpriteBatch>();
-            m_Reference.SetItems(m_Items, m_Count, atlas, referenceShader);
+            var instances = m_Traditional.Instances;
+            for (int i = 0; i < m_Count; i++)
+                instances[i] = ToInstance(m_Items[i]);
+
+            m_Traditional.Count = m_Count;
+            m_Traditional.MarkChanged();
+        }
+
+        /// <summary>
+        /// Builds the instance the hardware path draws. The transform carries the centre and the
+        /// full size only; the quad is turned towards the camera in the vertex shader, exactly
+        /// as the compute path's setup kernel does it.
+        /// </summary>
+        static CTInstancedSpriteBatch.Instance ToInstance(in CTStressItem item)
+        {
+            // Round trip the tint through 8 bits so it matches the compute path's packed RGBA8
+            // and neither side gets a precision advantage.
+            Color32 quantised = item.color;
+            return CTInstancedSpriteBatch.Instance.Create(
+                item.position,
+                new float2(item.halfSize.x * 2f, item.halfSize.y * 2f),
+                new float4(quantised.r, quantised.g, quantised.b, quantised.a) * (1f / 255f),
+                item.slice);
         }
 
         void ApplyMode()
         {
-            if (m_Batch == null || m_TraditionalRoot == null)
+            if (m_Batch == null || m_Traditional == null)
                 return;
 
             bool showCompute = mode != CTStressMode.Traditional;
             bool showTraditional = mode != CTStressMode.Compute;
 
             m_Batch.Enabled = showCompute;
-            m_TraditionalRoot.gameObject.SetActive(showTraditional);
+            m_Traditional.Enabled = showTraditional;
 
             // Only pull the groups apart when both are visible; otherwise each one sits where
             // the other one would, so flipping between the modes is a straight A/B.
             Vector3 offset = mode == CTStressMode.Both ? sideBySideOffset * 0.5f : Vector3.zero;
             ApplyComputeOffset(-offset);
-            m_TraditionalRoot.localPosition = offset;
-
-            // The reference mesh billboards against the current camera and its offset just
-            // moved, so refresh it here rather than waiting for a tick that an editor driven
-            // render never gets.
-            if (showTraditional && m_Reference != null)
-                m_Reference.RebuildNow();
+            // The hardware path applies its offset while gathering the sorted copy, so nothing
+            // has to be rewritten here.
+            m_Traditional.Offset = offset;
         }
 
         void ApplyComputeOffset(Vector3 offset)
@@ -196,23 +215,11 @@ namespace ComputeTransparency
             m_Batch?.Dispose();
             m_Batch = null;
 
-            if (m_TraditionalRoot != null)
-                DestroySafely(m_TraditionalRoot.gameObject);
+            m_Traditional?.Dispose();
+            m_Traditional = null;
 
-            m_TraditionalRoot = null;
-            m_Reference = null;
             m_ComputeOffset = Vector3.zero;
             m_Count = 0;
-        }
-
-        static void DestroySafely(Object target)
-        {
-            if (target == null)
-                return;
-            if (Application.isPlaying)
-                Object.Destroy(target);
-            else
-                Object.DestroyImmediate(target);
         }
     }
 }

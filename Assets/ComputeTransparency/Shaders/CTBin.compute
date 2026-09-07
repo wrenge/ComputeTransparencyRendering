@@ -1,28 +1,40 @@
-// Screen space binning: builds, for every tile, the list of triangles whose bounds
-// overlap it. The list is packed into a single pool sized by a prefix sum over the
-// per tile counts, so tiles that need many primitives can have them as long as the
-// average stays within the pool.
+// Screen space binning: builds, for every tile, the list of triangles whose bounds overlap it.
+// The list is packed into a single pool sized by a prefix sum over the per tile counts, so
+// tiles that need many primitives can have them as long as the average stays within the pool.
+//
+// Each tile's slice is further divided into _CTSegmentCount sub-slices, one per range of the
+// (depth ordered) triangle index space. Slots are still handed out atomically, so order inside
+// a sub-slice is arbitrary, but a triangle can only ever land in the sub-slice its depth range
+// owns. The result is a list that is sorted between segments by construction, which is what
+// lets the raster sort one segment at a time instead of the whole list.
 #pragma kernel CSClear
 #pragma kernel CSCount
+#pragma kernel CSTileTotals
 #pragma kernel CSScanBlocks
 #pragma kernel CSScanBlockSums
 #pragma kernel CSScanAdd
+#pragma kernel CSSegBase
 #pragma kernel CSScatter
 
 #include "CTCommon.hlsl"
 
 StructuredBuffer<CTTri> _CTTriangles;
 
-RWStructuredBuffer<uint> _CTTileCount;   // raw overlap count per tile
-RWStructuredBuffer<uint> _CTTileOffset;  // start of the tile's slice in _CTTileList
-RWStructuredBuffer<uint> _CTTileCursor;  // scatter write cursor per tile
-RWStructuredBuffer<uint> _CTBlockSums;   // per scan block totals, then block base offsets
-RWStructuredBuffer<uint> _CTTileList;    // the pool of triangle indices
+RWStructuredBuffer<uint> _CTTileCount;      // raw overlap count per tile, before any clamping
+RWStructuredBuffer<uint> _CTTileTotal;      // kept count per tile, the input to the prefix sum
+RWStructuredBuffer<uint> _CTTileOffset;     // start of the tile's slice in _CTTileList
+RWStructuredBuffer<uint> _CTTileEnd;        // one past the tile's last slot, absolute
+RWStructuredBuffer<uint> _CTTileSegCount;   // kept count per (tile, segment)
+RWStructuredBuffer<uint> _CTTileSegBase;    // absolute start of the (tile, segment) sub-slice
+RWStructuredBuffer<uint> _CTTileSegCursor;  // scatter write cursor per (tile, segment)
+RWStructuredBuffer<uint> _CTBlockSums;      // per scan block totals, then block base offsets
+RWStructuredBuffer<uint> _CTTileList;       // the pool of triangle indices
 
 uint4 _CTTileParams;      // x = tilesX, y = tilesY, z = tileCount, w = block count
 uint  _CTTriCount;
 uint  _CTTileListCapacity;
 uint  _CTTileSize;        // tile edge in pixels, a renderer feature setting
+uint  _CTSegmentCount;    // active segments, 1 .. CT_MAX_SEGMENTS
 float4 _CTScreenSize;     // xy = pixels, zw = 1/pixels
 
 groupshared uint gsScan[CT_SCAN_GROUP];
@@ -52,11 +64,8 @@ bool TriTileRange(CTTri t, out uint2 tileLo, out uint2 tileHi)
 void CSClear(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i < _CTTileParams.z)
-    {
-        _CTTileCount[i] = 0;
-        _CTTileCursor[i] = 0;
-    }
+    if (i < _CTTileParams.z * _CTSegmentCount)
+        _CTTileSegCount[i] = 0;
     if (i < _CTTileParams.w)
         _CTBlockSums[i] = 0;
 }
@@ -72,15 +81,47 @@ void CSCount(uint3 id : SV_DispatchThreadID)
     if (!TriTileRange(_CTTriangles[i], tileLo, tileHi))
         return;
 
+    uint seg = CTSegmentOf(i, _CTTriCount, _CTSegmentCount);
+
     for (uint ty = tileLo.y; ty <= tileHi.y; ty++)
     {
         uint row = ty * _CTTileParams.x;
         for (uint tx = tileLo.x; tx <= tileHi.x; tx++)
         {
             uint prev;
-            InterlockedAdd(_CTTileCount[row + tx], 1, prev);
+            InterlockedAdd(_CTTileSegCount[(row + tx) * _CTSegmentCount + seg], 1, prev);
         }
     }
+}
+
+// Turns the per segment counts into the tile's kept total and each segment's offset within the
+// tile. Each segment gets its own budget, so a tile that runs out of room drops the surplus of
+// whichever depth ranges are crowded rather than an arbitrary set of primitives, which is what
+// the atomic scatter used to do.
+[numthreads(CT_SCAN_GROUP, 1, 1)]
+void CSTileTotals(uint3 id : SV_DispatchThreadID)
+{
+    uint tile = id.x;
+    if (tile >= _CTTileParams.z)
+        return;
+
+    uint base = tile * _CTSegmentCount;
+    uint raw = 0;
+    uint total = 0;
+
+    for (uint s = 0; s < _CTSegmentCount; s++)
+    {
+        uint c = _CTTileSegCount[base + s];
+        raw += c;
+
+        uint keep = min(c, CT_MAX_SEG_PRIMS);
+        _CTTileSegCount[base + s] = keep;
+        _CTTileSegBase[base + s] = total;   // relative to the tile, made absolute by CSSegBase
+        total += keep;
+    }
+
+    _CTTileCount[tile] = raw;
+    _CTTileTotal[tile] = total;
 }
 
 // Exclusive scan inside one block of CT_SCAN_GROUP tiles, plus the block total.
@@ -88,7 +129,7 @@ void CSCount(uint3 id : SV_DispatchThreadID)
 void CSScanBlocks(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint tid : SV_GroupIndex)
 {
     uint i = id.x;
-    uint v = (i < _CTTileParams.z) ? min(_CTTileCount[i], CT_MAX_TILE_PRIMS) : 0;
+    uint v = (i < _CTTileParams.z) ? _CTTileTotal[i] : 0;
     gsScan[tid] = v;
     GroupMemoryBarrierWithGroupSync();
 
@@ -106,8 +147,8 @@ void CSScanBlocks(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint t
         _CTBlockSums[gid.x] = gsScan[tid];
 }
 
-// Turns the block totals into block base offsets. One group walks all blocks, so this
-// works for any screen size instead of being capped at CT_SCAN_GROUP blocks.
+// Turns the block totals into block base offsets. One group walks all blocks, so this works for
+// any screen size instead of being capped at CT_SCAN_GROUP blocks.
 [numthreads(CT_SCAN_GROUP, 1, 1)]
 void CSScanBlockSums(uint tid : SV_GroupIndex)
 {
@@ -155,8 +196,31 @@ void CSScanAdd(uint3 id : SV_DispatchThreadID)
     _CTTileOffset[i] += _CTBlockSums[i / CT_SCAN_GROUP];
 }
 
-// Writes triangle indices into the pool. Slots are handed out atomically, so the tile
-// list comes out unordered; the raster kernel sorts it before shading.
+// Now that the tile's slice has an absolute address, give every segment its own absolute
+// sub-slice and point its scatter cursor at the start of it.
+[numthreads(CT_SCAN_GROUP, 1, 1)]
+void CSSegBase(uint3 id : SV_DispatchThreadID)
+{
+    uint tile = id.x;
+    if (tile >= _CTTileParams.z)
+        return;
+
+    uint offset = _CTTileOffset[tile];
+    uint base = tile * _CTSegmentCount;
+
+    for (uint s = 0; s < _CTSegmentCount; s++)
+    {
+        uint absolute = offset + _CTTileSegBase[base + s];
+        _CTTileSegBase[base + s] = absolute;
+        _CTTileSegCursor[base + s] = absolute;
+    }
+
+    _CTTileEnd[tile] = offset + _CTTileTotal[tile];
+}
+
+// Writes triangle indices into the pool. Slots inside one segment are still handed out
+// atomically, so a segment comes out unordered and the raster sorts it; but a triangle can only
+// land in the sub-slice its depth range owns, so the segments themselves are in depth order.
 [numthreads(64, 1, 1)]
 void CSScatter(uint3 id : SV_DispatchThreadID)
 {
@@ -168,20 +232,19 @@ void CSScatter(uint3 id : SV_DispatchThreadID)
     if (!TriTileRange(_CTTriangles[i], tileLo, tileHi))
         return;
 
+    uint seg = CTSegmentOf(i, _CTTriCount, _CTSegmentCount);
+
     for (uint ty = tileLo.y; ty <= tileHi.y; ty++)
     {
         uint row = ty * _CTTileParams.x;
         for (uint tx = tileLo.x; tx <= tileHi.x; tx++)
         {
-            uint tile = row + tx;
-            uint capacity = min(_CTTileCount[tile], CT_MAX_TILE_PRIMS);
-            uint slot;
-            InterlockedAdd(_CTTileCursor[tile], 1, slot);
-            if (slot >= capacity)
-                continue;
+            uint idx = (row + tx) * _CTSegmentCount + seg;
+            uint dst;
+            InterlockedAdd(_CTTileSegCursor[idx], 1, dst);
 
-            uint dst = _CTTileOffset[tile] + slot;
-            if (dst < _CTTileListCapacity)
+            uint segEnd = _CTTileSegBase[idx] + _CTTileSegCount[idx];
+            if (dst < segEnd && dst < _CTTileListCapacity)
                 _CTTileList[dst] = i;
         }
     }

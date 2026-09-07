@@ -69,9 +69,20 @@ namespace ComputeTransparency
                      "1024 threads per group, which some mobile GPUs refuse.")]
             public CTTileSize tileSize = CTTileSize.Size8;
 
+            [Tooltip("How many depth ordered segments each tile's list is split into. The scatter " +
+                     "hands out slots atomically and scrambles an order that was already correct, " +
+                     "so the raster has to sort the list back. Segments keep the order between " +
+                     "them for free, and the raster only sorts the one it is walking - which, with " +
+                     "the early-out, is almost always the first. 1 is the old behaviour.\n\n" +
+                     "This also sets capacity: one segment holds at most 256 primitives, so a tile " +
+                     "holds 256 times this. Too few segments for a dense scene silently drops " +
+                     "primitives - the Tile Load debug view marks those tiles magenta.")]
+            [Range(1, 16)]
+            public int binSegments = 4;
+
             [Tooltip("Pool size for the per tile primitive lists, expressed as an average per tile. " +
                      "Individual tiles may exceed it as long as the average holds.")]
-            [Range(4, 512)]
+            [Range(4, 1024)]
             public int averagePrimitivesPerTile = 64;
 
             [Tooltip("Reject sprite pixels hidden by opaque geometry. Needs the depth texture enabled " +
@@ -107,15 +118,30 @@ namespace ComputeTransparency
             public ComputeShader rasterShader;
             public ComputeShader radixSortShader;
             public Shader compositeShader;
+
+            [Tooltip("Draws the Overdraw view for the hardware baseline. Only used while a " +
+                     "CTInstancedSpriteBatch asks for it; the compute path counts its own blends.")]
+            public Shader traditionalOverdrawShader;
         }
 
         public Settings settings = new Settings();
 
         ComputeTransparencyPass m_Pass;
+        CTTraditionalOverdrawPass m_OverdrawPass;
         Material m_CompositeMaterial;
+        Material m_OverdrawMaterial;
 
         public override void Create()
         {
+            // The hardware baseline's debug view does not need any of the compute machinery, so
+            // it is built whether or not the rasterizer itself validates.
+            if (settings.traditionalOverdrawShader != null)
+            {
+                if (m_OverdrawMaterial == null)
+                    m_OverdrawMaterial = CoreUtils.CreateEngineMaterial(settings.traditionalOverdrawShader);
+                m_OverdrawPass = new CTTraditionalOverdrawPass(settings, m_OverdrawMaterial);
+            }
+
             if (!Validate())
                 return;
 
@@ -128,11 +154,14 @@ namespace ComputeTransparency
 
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
         {
-            if (m_Pass == null)
-                return;
-
             if (renderingData.cameraData.cameraType == CameraType.Preview ||
                 renderingData.cameraData.cameraType == CameraType.Reflection)
+                return;
+
+            if (m_OverdrawPass != null && CTTraditionalOverdrawPass.Armed)
+                renderer.EnqueuePass(m_OverdrawPass);
+
+            if (m_Pass == null)
                 return;
 
             m_Pass.renderPassEvent = settings.renderPassEvent;
@@ -143,8 +172,11 @@ namespace ComputeTransparency
         {
             m_Pass?.Dispose();
             m_Pass = null;
+            m_OverdrawPass = null;
             CoreUtils.Destroy(m_CompositeMaterial);
             m_CompositeMaterial = null;
+            CoreUtils.Destroy(m_OverdrawMaterial);
+            m_OverdrawMaterial = null;
         }
 
         bool Validate()

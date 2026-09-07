@@ -1,0 +1,74 @@
+/* The demo panel. Kept dark and translucent so it reads over the sprite cloud without
+   hiding the thing it is there to measure. */
+
+.ct-panel {
+    position: absolute;
+    left: 16px;
+    top: 16px;
+    width: 276px;
+    padding: 12px 14px;
+    background-color: rgba(15, 18, 23, 0.86);
+    border-radius: 8px;
+}
+
+.ct-title {
+    -unity-font-style: bold;
+    font-size: 15px;
+    color: rgb(255, 255, 255);
+    margin-bottom: 10px;
+}
+
+.ct-row {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.ct-row-label {
+    flex-grow: 1;
+    color: rgb(199, 204, 214);
+}
+
+.ct-row-value {
+    width: 62px;
+    color: rgb(255, 255, 255);
+    -unity-text-align: middle-center;
+}
+
+/* Buttons come out of the default theme with a border and a light background, which reads as
+   an editor control rather than part of the overlay, so they are restated here. */
+.ct-step,
+.ct-reset {
+    background-color: rgb(43, 48, 59);
+    color: rgb(255, 255, 255);
+    border-width: 0;
+    border-radius: 5px;
+    margin: 0 2px;
+    padding: 0 8px;
+    min-width: 30px;
+    height: 24px;
+}
+
+.ct-step:hover,
+.ct-reset:hover {
+    background-color: rgb(58, 65, 79);
+}
+
+.ct-step:disabled {
+    opacity: 0.35;
+}
+
+.ct-reset {
+    margin: 12px 0 0 0;
+    height: 28px;
+}
+
+.ct-control {
+    margin-bottom: 8px;
+    color: rgb(199, 204, 214);
+}
+
+.ct-control > Label {
+    min-width: 78px;
+    color: rgb(199, 204, 214);
+}

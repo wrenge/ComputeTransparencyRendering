@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ui:UXML xmlns:ui="UnityEngine.UIElements" editor-extension-mode="False">
+    <Style src="project://database/Assets/ComputeTransparency/Demo/UI/CTDemoUI.uss" />
+    <ui:VisualElement name="panel" class="ct-panel">
+        <ui:Label name="title" text="Compute Transparency" class="ct-title" />
+
+        <ui:VisualElement name="instances-row" class="ct-row">
+            <ui:Label text="Instances" class="ct-row-label" />
+            <ui:Button name="instances-less" text="&#8722;" class="ct-step" />
+            <ui:Label name="instances-value" text="0" class="ct-row-value" />
+            <ui:Button name="instances-more" text="+" class="ct-step" />
+        </ui:VisualElement>
+
+        <ui:Slider name="alpha" label="Alpha" low-value="0" high-value="1" value="0.9"
+                   show-input-field="true" class="ct-control" />
+
+        <ui:DropdownField name="renderer" label="Renderer" index="0" class="ct-control" />
+
+        <ui:DropdownField name="debug" label="Debug" index="0" class="ct-control" />
+
+        <ui:Button name="reset" text="Reset" class="ct-reset" />
+    </ui:VisualElement>
+</ui:UXML>

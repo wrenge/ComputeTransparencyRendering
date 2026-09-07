@@ -604,3 +604,356 @@ Whatever the number means, it is not a comparison.
    tile 4 unusable and it is pure waste at every size, even though it is not the 8K bottleneck.
    The principled fix is binning that emits per tile lists already in depth order, so the raster
    streams them lazily and never materialises the tail.
+
+### Corrections to the two proposals above
+
+**Proposal 1 as written is not available.** URP hard-codes `desc.enableRandomWrite = false` on the
+camera target descriptor (`UniversalRenderPipelineCore.cs:1630`), and the camera colour attachment
+is built from it, so a compute kernel cannot write the camera target directly. What is left
+without forking URP: shrink the intermediate (RGBA16F to a 4 byte format was measured at 0.45 ms
+of the 2.4 ms gap at 8K, and costs HDR range), and skip the raster write and composite read on
+tiles no primitive reached (nothing in this stress scene, where sprites cover the screen; a real
+win in a sparse one).
+
+**Removing the sort is not free.** With the sort disabled the dense scene got *slower*, 8.62 to
+10.95 ms. Sorted lists are ascending triangle indices, so `_CTTriangles[gsList[i]]` walks the
+80 byte structs in address order; unsorted it scatters through a 6.4 MB buffer and misses cache.
+Any replacement has to preserve depth order for locality, not only for correctness — which is what
+ordered binning does and what simply deleting the sort does not.
+
+**What the sort actually costs, measured cleanly.** Capping `CT_MAX_TILE_PRIMS` to 16 leaves the
+sort enabled but makes the list trivial. At 40000 sprites, 4K, tile 16, with shading disabled:
+8.52 ms falls to 6.05 ms. So the list load plus bitonic sort is **2.5 ms of a 10.1 ms frame, 24%**,
+at the density where this renderer wins. Removing it would move the dense case from 1.65x faster
+than the traditional path to roughly 2.3x. (Total frame time is unchanged in that capped run only
+because a 16 entry list stops pixels saturating, so shading grows by as much as preparation
+shrinks — and the image is wrong. It isolates the cost; it is not a fix.)
+
+---
+
+## Work log — segmented scatter
+
+The triangles are already in depth order when they reach binning: `CSSetup` reads
+`_CTSortedIndices[i]` and writes to triangle slots `i*2` and `i*2+1`, so triangle index order
+*is* depth order by construction, which is why culled sprites keep their slot with `valid = 0`.
+Nothing about the input is unsorted. What loses the order is `CSScatter`'s `InterlockedAdd` on
+the per tile cursor: the slot a triangle gets depends on which group arrives first. The raster
+then spent 55 barrier stages and 4 KB of groupshared rebuilding an order that existed two passes
+earlier. The task was never to produce order, only to stop destroying it.
+
+### How the order is kept
+
+Each tile's slice is divided into `_CTSegmentCount` sub-slices, one per range of the triangle
+index space. Slots inside a sub-slice are still handed out atomically, so a segment is still
+unordered, but a triangle can only ever land in the sub-slice its depth range owns. The list is
+therefore sorted between segments by construction, and the raster sorts only the segment it is
+currently walking — which, with the early-out consuming about 8 primitives, is almost always the
+first one.
+
+The ordering comes from the layout, not from dispatch order, so the scatter stays a single pass.
+The bin pipeline gains two small per tile passes:
+
+- `CSTileTotals` folds the per segment counts into the tile total and each segment's offset
+  within the tile. The per tile budget is spent front to back, so **a tile that overflows now
+  drops its farthest primitives** instead of an arbitrary set of them.
+- `CSSegBase` turns those offsets absolute once the scan has placed the tile, and aims each
+  segment's scatter cursor at its own sub-slice.
+
+`_CTTileCursor` is gone, replaced by `_CTTileSegCursor`. `_CTTileCount` now carries the raw
+unclamped count for the debug views, and `_CTTileTotal` carries the kept count that feeds the
+prefix sum. The raster's segment loop bound is the compile time `CT_MAX_SEGMENTS` because it
+contains group syncs, but the buffers are sized by the setting, so unused segments read nothing
+and fall through; a tile leaves the loop as soon as no pixel can take a contribution or nothing
+is left past the current segment.
+
+### Verification
+
+960x540, 10000 sprites. Every segment count against 1 segment, which reproduces the old
+behaviour, at tile 8 and tile 16:
+
+| segments | mean | worst pixel |
+|----------|------|-------------|
+| 2 | 0.000000 | 0.000000 |
+| 3 | 0.000000 | 0.000000 |
+| 4 | 0.000000 | 0.000000 |
+| 5 | 0.000000 | 0.000000 |
+| 8 | 0.000000 | 0.000000 |
+
+Bit identical, non powers of two included. Against the traditional path: compute luma 0.56319 vs
+0.56496, mean 0.00179, worst pixel 0.04665 — the usual residual, unchanged.
+
+### Payoff
+
+3840x2160, tile 16, 40000 sprites, traditional interleaved with every segment count so clock
+drift hits both equally:
+
+| | ms | vs traditional |
+|---|-----|----------------|
+| traditional | 15.58 | — |
+| 1 segment | 11.14 | 0.71x |
+| 2 segments | 8.91 | 0.57x |
+| 3 segments | 8.16 | 0.52x |
+| 4 segments | 8.06 | 0.52x |
+| 6 segments | 7.97 | 0.51x |
+| 8 segments | 8.19 | 0.53x |
+
+**3.1 ms of an 11.1 ms frame, 28%**, and the compute path goes from 1.4x to 1.9x faster than the
+traditional one. It plateaus at 4, which is the default; 6 and 8 are inside the noise and cost
+more memory. This is close to the 2.5 ms the isolation predicted, and the extra comes from the
+better cache behaviour of shorter, denser lists.
+
+At 8K with 10000 sprites it changes nothing, exactly as predicted: that case was never bound by
+list preparation, and capping `CT_MAX_TILE_PRIMS` to 16 had already shown preparation was worth
+only 0.7 ms there.
+
+### One bug worth recording
+
+Sizing the segment buffers by the setting rather than by `CT_MAX_SEGMENTS` meant the raster had
+to read `_CTSegmentCount` to compute the stride — but that uniform was only being set in
+`SetBinConstants`, which the raster pass does not call. It read 0, every segment was skipped and
+the compute path rendered almost nothing (luma 0.029 against 0.565). The first run after the
+change looked like the *traditional* group had gone missing, because the harness compared against
+it; it was the compute side that was blank. Worth remembering that a missing compute uniform
+reads as zero and fails silently rather than loudly.
+
+### Still open
+
+- `CT_MAX_TILE_PRIMS` is still 1024 and `gsList` is still sized for it, so the raster still burns
+  4 KB of groupshared per group even though a segment now holds a quarter of that. Shrinking it
+  is the next easy occupancy win, and it is now safe to do because overflow drops the farthest
+  primitives rather than arbitrary ones.
+- The per pixel gap at high resolution is untouched; that is the intermediate buffer round trip,
+  and URP blocks the direct fix.
+
+---
+
+## Work log — smaller groupshared list and an 8 bit intermediate
+
+### Segment sized groupshared
+
+`CT_MAX_TILE_PRIMS` (1024) is gone, replaced by `CT_MAX_SEG_PRIMS` (256). The raster only ever
+sorts one segment at a time, so the tile total was never what sized the scratch array; `gsList`
+drops from 4 KB to 1 KB per group and `chunkCount` from 128 to 32. Each segment now gets its own
+budget in `CSTileTotals` rather than the tile spending one shared budget front to back.
+
+**A tile's capacity is now 256 x the segment count.** At the default 4 segments that is 1024,
+exactly the old cap, so the default behaviour is unchanged — but the setting now controls
+capacity as well as speed, which the tooltip says and which the tile load view shows in magenta.
+
+Measured, 960x540, against the traditional path (the pre-change figures were mean 0.001793 /
+worst 0.046653 at 10000 sprites and 0.001854 / 0.037239 at 40000):
+
+| sprites | segments | mean | worst |
+|---------|----------|------|-------|
+| 10000 | 2, 4, 8 | 0.001939 | 0.046971 |
+| 40000 | 4 | 0.002004 | 0.038335 |
+| 40000 | 8 | 0.002003 | 0.038335 |
+| 40000 | **2** | **0.033349** | **0.823523** |
+
+The 2 segment row at 40000 sprites is the new capacity limit doing exactly what it says: 849
+primitives binned per tile over 2 segments is ~425 each against a ceiling of 256, so the surplus
+is dropped and the image is visibly wrong. Four segments and up are clean. This is the trap the
+setting now carries, and it is why the default stays at 4.
+
+**The occupancy win did not materialise.** 4K, 40000 sprites, tile 16, interleaved: 8.46 ms at 4
+segments against 8.06 ms before the change, and 7.79 ms at 6 segments — all inside the run to run
+spread (the traditional path moved 15.58 to 15.74 across the same runs). Quartering the
+groupshared footprint changed nothing measurable on this GPU. The change stands on the memory
+argument and on mobile, where threadgroup memory budgets are tighter, not on a measured speedup
+here. Recorded as a negative result rather than quietly dropped.
+
+### 8 bit intermediate without HDR
+
+`_CTResult` is `R8G8B8A8_UNorm` when `cameraData.isHdrEnabled` is false, `R16G16B16A16_SFloat`
+otherwise. The accumulated colour is a sum of `T * alpha * colour` whose total weight cannot
+exceed 1, so LDR content stays inside [0, 1] and does not need the float target; the buffer is
+written by the raster kernel and read straight back by the composite, which at 8K is 530 MB of
+pure per pixel traffic that the hardware path never pays.
+
+Cost in accuracy: the mean error against the traditional path rises by 0.00015 (0.001793 to
+0.001939 at 10000 sprites, where no capacity limit is in play so the delta is the quantisation
+alone). Transmittance is quantised to 8 bits, which is the same resolution as the default
+epsilon, so the early-out is unaffected. Deep gradients in near black may band; switching the
+URP asset to HDR restores the float target.
+
+Note the format is chosen per camera from the HDR flag, not from a setting. This project's URP
+asset has `supportsHDR` off, so the 8 bit path is the one running.
+
+The earlier controlled measurement of this change on its own put it at 0.45 ms of the 2.4 ms per
+pixel gap at 8K. The runs above could not resolve it again: wall clock at 8K in the editor swings
+about 20% between blocks, and the traditional path alone moved 20.64 to 17.66 ms between runs.
+The 8K figures in this session are not precise enough to claim a number, only the direction.
+
+## Work log — a demo scene, and the traditional path rebuilt on RenderMeshInstanced
+
+Two things at once: a scene meant for a build rather than for the profiler, and a rewrite of the
+baseline the compute path is measured against.
+
+### The baseline no longer bakes a mesh
+
+`CTReferenceSpriteBatch` rewrote four vertices per sprite into one mesh every frame, because
+billboards follow the camera. That is a per frame mesh upload the baseline was paying for reasons
+that have nothing to do with what is being compared, and it flattered the compute path. It is gone,
+replaced by `CTInstancedSpriteBatch`: one `Graphics.RenderMeshInstanced` over a shared unit quad,
+the quad turned towards the camera in the vertex shader exactly as `CTSetup.compute` does it, and
+the only per frame CPU work is the depth sort the transparent queue genuinely requires.
+
+The sort is a Burst `IJobParallelFor` producing a packed `ulong` key (monotonic float bits in the
+high word, index in the low word), a `SortJob` over it, and a gather into a separate draw ordered
+copy. Keeping the sorted copy separate means `Instances` stays index aligned with whatever filled
+it, which is what lets the demo update it incrementally.
+
+Instanced primitive order is guaranteed by the graphics APIs, so a back to front instance array
+blends correctly in one draw.
+
+### Three faults, stacked, all presenting as "the draw is invisible"
+
+The rewritten shader rendered nothing, at any instance count. It took three separate fixes, each
+of which fully hid the next.
+
+**One: an instanced property that is not a material property.** `_BaseColor` and `_SliceParams`
+were declared with `UNITY_DEFINE_INSTANCED_PROP` but not in the `Properties` block. They then read
+back as zero, and zero alpha through `Blend SrcAlpha OneMinusSrcAlpha` writes nothing at all - the
+frame is bit for bit identical to one with no draw in it. Declaring them made a plain
+`MeshRenderer` with the same material draw, which is what separated "the shader is broken" from
+"instancing is broken".
+
+**Two: no `#pragma target`.** `UnityInstancing.hlsl` gates its support on `SHADER_TARGET`, and the
+default is well below the bar. The instanced variant still compiles - every
+`UNITY_ACCESS_INSTANCED_PROP` just silently resolves to the material's own value. `#pragma require
+2darray` does not raise `SHADER_TARGET`; only `#pragma target` does. Now 4.5.
+
+**Three: the per instance property block never arrives.** With both of those fixed the draw
+renders, the transforms are per instance - the cloud has the right shape and grows with the count -
+and every sprite is still the material's white. No exception, no warning, no error: Unity accepts
+the 96 byte instance struct, uploads the matrix, and drops the rest.
+
+Rather than keep reverse engineering that, the tint and the atlas slice now ride in the transform,
+which is the one piece of per instance data that is delivered reliably. A translate plus a per axis
+scale uses six of the matrix's sixteen elements, so `_m01`, `_m02`, `_m10`, `_m12` carry RGBA and
+`_m20` carries the slice; `CTInstancedSpriteBatch.Instance.Create` packs them and the vertex shader
+reads them straight back out. The instance struct is now nothing but a `float4x4`.
+
+The price is that the matrix is no longer a well formed transform. Nothing here needs it to be: the
+vertex shader reads elements out one at a time and never multiplies by it, the sprites are unlit so
+the derived `unity_WorldToObject` is never sampled, and the only visible effect is on culling, where
+each instance's bounds grow by at most a unit against a cloud of radius 11.
+
+### The measurement harness lied twice before any of that
+
+Worth recording, because both failures produce plausible looking numbers.
+
+An offscreen probe camera in **edit mode** never sees an immediate mode draw. `RenderMeshInstanced`
+followed by `cam.Render()` renders nothing - including for a URP/Lit control that renders perfectly
+in play mode. An earlier control run in this same harness reported a healthy luma and was taken as
+proof that the API was fine; it was measuring the scene behind the draw, not the draw.
+
+And a probe camera does not isolate anything from the compute pass, which collects its sprites
+itself and ignores the camera's culling mask. A probe with `cullingMask = 0` and a black clear still
+came back at luma 0.718 - all of it the compute path's own cloud. Every A/B from here on runs in
+play mode and captures a baseline frame with no draw submitted, as the control.
+
+### Numbers
+
+Play mode, 480x270, `ARGBFloat`, one camera position, compute against the instanced baseline:
+
+| count | mean | worst | lumaCompute | lumaTraditional |
+|-------|------|-------|-------------|-----------------|
+| 100 | 0.000287 | 0.887966 | 0.02005 | 0.01997 |
+| 1000 | 0.002589 | 0.380586 | 0.07461 | 0.07598 |
+| 5000 | 0.004325 | 0.243431 | 0.08697 | 0.08968 |
+| 10000 | 0.004775 | 0.765218 | 0.08618 | 0.08898 |
+
+In line with the RGBA8 quantisation floor the two paths have always agreed to. The worst case
+column is edge pixels: two rasterizers disagreeing about coverage on a sprite silhouette, which is
+expected and does not accumulate.
+
+### The demo scene
+
+`Assets/Scenes/CTDemo.unity`, first in the build settings. A hollow ball of sprites of radius 11
+around an opaque sphere, so the depth test has something to prove; a camera that orbits, tilts and
+dollies between 14 and 40 units on three periods that do not divide into each other; the UI panel;
+and Graphy.
+
+`CTDemoCloud` allocates once for the largest step on the ladder and never resizes. Every sprite is
+a pure function of its index and the seed - position, size, hue and slice all come out of an integer
+hash of the index - so growing the cloud from 1000 to 10000 generates and builds only the indices
+`[1000, 10000)`, and shrinking it only lowers a count. Nothing is cleared and nothing is rebuilt.
+The alpha slider is the one control that does touch every sprite, because that is what it means,
+but the items never stored an alpha, so it rebuilds the two instance arrays and not the cloud. Both
+instance formats - the compute path's `CTSpriteInstance` and the hardware path's matrix - are
+written in the same Burst job from the same quantised colour, so switching paths costs nothing at
+the moment of the switch and the two are provably built from the same numbers.
+
+`startPath` on the cloud picks which renderer the scene opens on. It exists because entering play
+mode reconstructs everything, so there was otherwise no way to open straight into the hardware
+baseline, which made it awkward to test.
+
+### The panel
+
+`CTDemoUI.uxml` and `CTDemoUI.uss` under `Demo/UI`, assigned to the scene's `UIDocument`; the
+component only looks controls up by name and wires them to the cloud. Instance count with `-` and
+`+` over the ladder, an alpha slider, a renderer dropdown, a debug view dropdown and Reset. The
+dropdown choices are filled from the enums in code rather than spelled out in the UXML, so there is
+one place to change them.
+
+The debug views come out of the compute pass, so the dropdown greys out while the traditional path
+is running. The panel reaches the pass through a direct serialized reference to the
+`ComputeTransparencyRenderFeature` sub asset - the feature reads `m_Settings` live every frame, so
+writing to it takes effect immediately without touching `SetActive` and dirtying the renderer asset.
+
+Verified in play mode by layout rather than by screenshot: the panel resolves to 276x294 at (16, 16)
+on a 1791x1235 screen, every named control has a non degenerate `worldBound`, and driving them moves
+the model - a `-` click takes the count 10000 to 5000 and the label with it, the slider writes
+`cloud.Alpha`, the dropdown switches the path.
+
+### Overdraw for the hardware baseline
+
+The Overdraw view existed only for the compute rasterizer, which counts its blends inside the loop
+that performs them. The hardware path has no such loop to instrument, so its count is a second draw
+of the same billboards into a one channel target with additive blending, resolved through the same
+`CTHeat` ramp and the same `debugRange`. Both views now count the same thing - sprites covering a
+pixel that pass the depth test - so the difference between the two pictures is exactly what the
+early-out saves.
+
+The count is drawn by the renderer feature (`CTTraditionalOverdrawPass`), not by the batch. An
+immediate mode `Graphics.RenderMeshInstanced` can only render into the camera's own colour target,
+and accumulating a count in there would mean fighting whatever format and colour encoding that
+target happens to have - a linear increment of 1/255 stored through an sRGB encode quantises badly
+at the dark end, and an HDR target changes the arithmetic again. The pass allocates its own
+`R32_SFloat`, so the sum is exact and cannot saturate.
+
+The draw is procedural rather than instanced through a mesh. `CTInstancedSpriteBatch.Instance` is
+now a bare `float4x4`, so the batch mirrors the instances into a `GraphicsBuffer` and the pass calls
+`DrawProcedural` with six vertices and one instance per sprite. That sidesteps
+`CommandBuffer.DrawMeshInstanced`'s 1023 instance limit, which at the top of the demo's ladder would
+otherwise have been a thousand draw calls. The buffer is re-uploaded only when the batch's version
+moves, so a static cloud uploads once. The instance buffer travels in a `MaterialPropertyBlock`
+rather than on the material: material state is resolved when the command buffer executes, so
+several batches sharing one material would all end up drawing the last one's instances.
+
+The count pass borrows the camera's depth attachment read only, so a sprite behind the opaque object
+does not count - which is what the compute path's own depth test does before it increments.
+Sorting is skipped entirely while counting: an additive sum does not care about order.
+
+The batch draws either the image or the count, never both, and the feature leaves the pass out of
+the frame unless some live batch is asking for it, so nothing is paid when the view is off.
+
+Verified in play mode at 1000 sprites, `debugRange` 64:
+
+| alpha | mean diff | heat, compute | heat, traditional |
+|-------|-----------|---------------|-------------------|
+| 0.05 | 0.00113 | 0.02132 | 0.02126 |
+| 0.90 | 0.01956 | 0.01998 | 0.02126 |
+
+Three things fall out of that. At alpha 0.05 the two views agree to 0.001: transmittance barely
+drops, the early-out almost never fires, and the compute rasterizer really is walking every sprite -
+which is the control that says both views are counting the same thing. At alpha 0.90 they diverge
+and the compute view is the cooler of the two, which is the early-out doing its job. And the
+hardware count is identical at both alphas, to five decimals, because the hardware path shades every
+layer no matter how opaque it is - the one number in this table that is a property of the renderer
+rather than of the scene.
+
+In the demo the Debug dropdown now stays enabled on the traditional path. Overdraw is the one view
+both renderers can produce; Transmittance, Tile load and Walk length describe the compute
+rasterizer's tiles and its early-out, so they do nothing while the hardware path is showing.

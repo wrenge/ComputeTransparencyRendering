@@ -10,9 +10,28 @@
 #define CT_TILE_SIZE_MIN 4
 #define CT_TILE_SIZE_MAX 32
 
-// Upper bound on how many primitives a single tile can hold. The list is sorted in
-// groupshared memory, so this also bounds the LDS footprint of the raster kernel.
-#define CT_MAX_TILE_PRIMS 1024
+// Upper bound on how many primitives one *segment* of a tile's list can hold. The raster sorts
+// one segment at a time in groupshared memory, so this is what sizes the LDS footprint, and the
+// tile as a whole can hold this times the segment count. Keeping it small is worth real
+// occupancy: the group's scratch array is the only thing standing between the kernel and more
+// concurrent tiles.
+#define CT_MAX_SEG_PRIMS 256
+
+// The scatter hands out slots atomically, so a tile's list comes back as an arbitrary
+// permutation of a range that was already in depth order. Splitting the triangle range into
+// segments and giving each segment its own sub-slice of the tile keeps the order *between*
+// segments for free, so the raster only sorts the segment it is currently walking - and with
+// the early-out it almost never gets past the first one. The count is a renderer feature
+// setting; this is the ceiling the buffers are sized for. 1 reproduces the old behaviour.
+#define CT_MAX_SEGMENTS 8
+
+// Which segment a triangle belongs to. Triangle index order is depth order, so an even split
+// of the index range is an even split of the depth order.
+uint CTSegmentOf(uint triIndex, uint triCount, uint segmentCount)
+{
+    uint seg = (triIndex * segmentCount) / max(triCount, 1u);
+    return min(seg, segmentCount - 1);
+}
 
 // Thread count of the prefix-sum kernels.
 #define CT_SCAN_GROUP 256
