@@ -48,6 +48,13 @@ Shader "ComputeTransparency/Reference Sprite"
             TEXTURE2D_ARRAY(_BaseMap);
             SAMPLER(sampler_BaseMap);
 
+            // Set globally by ComputeTransparencyRenderFeature so both paths switch together;
+            // comparing a textured baseline against an untextured compute path would measure
+            // nothing. Declared outside any cbuffer because it is a global, not a material
+            // property, and the sense is inverted on purpose: an unset global reads 0, which has
+            // to mean ordinary textured shading.
+            float _CTUntextured;
+
             struct Attributes
             {
                 float4 positionOS : POSITION;
@@ -98,7 +105,10 @@ Shader "ComputeTransparency/Reference Sprite"
             {
                 // The tint arrives already quantised to 8 bits per channel, exactly as the
                 // compute path unpacks its RGBA8, so both paths multiply by the same numbers.
-                float4 texel = SAMPLE_TEXTURE2D_ARRAY(_BaseMap, sampler_BaseMap, input.uv.xy, input.uv.z);
+                float4 texel = 1.0;
+                if (_CTUntextured < 0.5)
+                    texel = SAMPLE_TEXTURE2D_ARRAY(_BaseMap, sampler_BaseMap, input.uv.xy, input.uv.z);
+
                 return texel * input.color;
             }
             ENDHLSL

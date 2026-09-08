@@ -75,10 +75,12 @@ MonoBehaviour:
     averagePrimitivesPerTile: 1024
     depthTest: 1
     epsilon: 0.075
-    sortMode: 1
+    sortMode: 0
+    textures: 0
     renderPassEvent: 450
     debugMode: 0
     debugRange: 64
+    gpuTimers: 0
     setupShader: {fileID: 7200000, guid: ddade169b7e68488f87e46a2cc0b892c, type: 3}
     binShader: {fileID: 7200000, guid: 48d14b53d0e004e3e90b0bccae74b299, type: 3}
     rasterShader: {fileID: 7200000, guid: 2ee9557881bad448191e6ed290d9707f, type: 3}

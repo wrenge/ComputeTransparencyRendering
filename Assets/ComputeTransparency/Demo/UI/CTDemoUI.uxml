@@ -4,22 +4,44 @@
     <ui:VisualElement name="panel" class="ct-panel">
         <ui:Label name="title" text="Compute Transparency" class="ct-title" />
 
-        <ui:VisualElement name="instances-row" class="ct-row">
-            <ui:Label text="Instances" class="ct-row-label" />
-            <ui:Button name="instances-less" text="&#8722;" class="ct-step" />
-            <ui:Label name="instances-value" text="0" class="ct-row-value" />
-            <ui:Button name="instances-more" text="+" class="ct-step" />
+        <ui:VisualElement name="tabs" class="ct-tabs">
+            <ui:Button name="tab-controls" text="Controls" class="ct-tab" />
+            <ui:Button name="tab-timers" text="Timers" class="ct-tab" />
         </ui:VisualElement>
 
-        <ui:Slider name="alpha" label="Alpha" low-value="0" high-value="1" value="0.9"
-                   show-input-field="true" class="ct-control" />
+        <ui:VisualElement name="page-controls" class="ct-page">
+            <ui:VisualElement name="instances-row" class="ct-row">
+                <ui:Label text="Instances" class="ct-row-label" />
+                <ui:Button name="instances-less" text="&#8722;" class="ct-step" />
+                <ui:Label name="instances-value" text="0" class="ct-row-value" />
+                <ui:Button name="instances-more" text="+" class="ct-step" />
+            </ui:VisualElement>
 
-        <ui:DropdownField name="renderer" label="Renderer" index="0" class="ct-control" />
+            <ui:Slider name="alpha" label="Alpha" low-value="0" high-value="1" value="0.9"
+                       show-input-field="true" class="ct-control" />
 
-        <ui:DropdownField name="debug" label="Debug" index="0" class="ct-control" />
+            <ui:DropdownField name="renderer" label="Renderer" index="0" class="ct-control" />
 
-        <ui:Button name="reset" text="Reset" class="ct-reset" />
+            <ui:DropdownField name="debug" label="Debug" index="0" class="ct-control" />
 
-        <ui:Label name="device" text="" class="ct-device" />
+            <ui:VisualElement name="textures-row" class="ct-row">
+                <ui:Label text="Textures" class="ct-row-label" />
+                <ui:Toggle name="textures" class="ct-toggle" />
+            </ui:VisualElement>
+
+            <ui:Button name="reset" text="Reset" class="ct-reset" />
+
+            <ui:Label name="device" text="" class="ct-device" />
+        </ui:VisualElement>
+
+        <ui:VisualElement name="page-timers" class="ct-page">
+            <ui:VisualElement name="timers-row" class="ct-row">
+                <ui:Label text="GPU timers" class="ct-row-label" />
+                <ui:Toggle name="timers" class="ct-toggle" />
+            </ui:VisualElement>
+
+            <ui:VisualElement name="timers-list" class="ct-timers" />
+            <ui:Label name="timers-note" text="" class="ct-timers-note" />
+        </ui:VisualElement>
     </ui:VisualElement>
 </ui:UXML>

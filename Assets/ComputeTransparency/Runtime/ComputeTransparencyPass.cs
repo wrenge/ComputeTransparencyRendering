@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
+using UnityEngine.Profiling;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
@@ -16,6 +17,33 @@ namespace ComputeTransparency
         const int k_MaxSegments = 8;       // must match CT_MAX_SEGMENTS
         const int k_SetupGroup = 64;
         const int k_BinGroup = 64;
+
+        // Pass names. Each is both the render graph pass's label and its GPU timer's sampler
+        // name, so the profiler and the demo panel agree on what a row is.
+        const string k_PassSetup = "CT Setup";
+        const string k_PassBinClear = "CT Bin Clear";
+        const string k_PassBinCount = "CT Bin Count";
+        const string k_PassBinTotals = "CT Bin Tile Totals";
+        const string k_PassScanBlocks = "CT Scan Blocks";
+        const string k_PassScanBlockSums = "CT Scan Block Sums";
+        const string k_PassScanAdd = "CT Scan Add";
+        const string k_PassSegBase = "CT Bin Segment Bases";
+        const string k_PassScatter = "CT Bin Scatter";
+        const string k_PassRaster = "CT Raster";
+        const string k_PassComposite = "CT Composite";
+        const string k_PassSortPrepare = "CT Sort Prepare";
+        const string k_PassSortCount = "CT Sort Count";
+        const string k_PassSortScanBlocks = "CT Sort Scan Blocks";
+        const string k_PassSortScanBlockSums = "CT Sort Scan Block Sums";
+        const string k_PassSortScanAdd = "CT Sort Scan Add";
+        const string k_PassSortScatter = "CT Sort Scatter";
+
+        // Timer groups, which is how the demo panel folds seventeen rows into something readable.
+        const string k_GroupSetup = "Setup";
+        const string k_GroupSort = "Sort";
+        const string k_GroupBin = "Bin";
+        const string k_GroupRaster = "Raster";
+        const string k_GroupComposite = "Composite";
 
         static class ShaderIds
         {
@@ -48,6 +76,7 @@ namespace ComputeTransparency
             public static readonly int ReversedZ = Shader.PropertyToID("_CTReversedZ");
             public static readonly int DepthTestEnabled = Shader.PropertyToID("_CTDepthTestEnabled");
             public static readonly int Epsilon = Shader.PropertyToID("_CTEpsilon");
+            public static readonly int Untextured = Shader.PropertyToID("_CTUntextured");
             public static readonly int TileSize = Shader.PropertyToID("_CTTileSize");
             public static readonly int DebugMode = Shader.PropertyToID("_CTDebugMode");
             public static readonly int DebugRange = Shader.PropertyToID("_CTDebugRange");
@@ -73,6 +102,10 @@ namespace ComputeTransparency
             public ComputeShader shader;
             public int kernel;
             public Vector3Int groups;
+
+            // Null unless the GPU timers are on. Captured at record time so the render func does
+            // not have to look at the settings.
+            public CustomSampler timer;
 
             public BufferHandle instances;
             public BufferHandle sortedIndices;
@@ -103,6 +136,7 @@ namespace ComputeTransparency
             public int reversedZ;
             public int depthTest;
             public float epsilon;
+            public int untextured;
             public int tileSize;
             public int segmentCount;
             public int debugMode;
@@ -114,6 +148,8 @@ namespace ComputeTransparency
             public ComputeShader shader;
             public int kernel;
             public int groups;
+
+            public CustomSampler timer;
 
             public BufferHandle instances;
             public BufferHandle keysIn;
@@ -136,6 +172,8 @@ namespace ComputeTransparency
         {
             public TextureHandle source;
             public Material material;
+
+            public CustomSampler timer;
         }
 
         readonly ComputeTransparencyRenderFeature.Settings m_Settings;
@@ -193,6 +231,11 @@ namespace ComputeTransparency
 
         public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
         {
+            // Before the early returns below: the toggle has to take effect, and the recorders
+            // have to be read, even on a frame this pass decides not to record anything on.
+            CTGpuTimers.Enabled = m_Settings.gpuTimers;
+            CTGpuTimers.Tick();
+
             var cameraData = frameData.Get<UniversalCameraData>();
             var resourceData = frameData.Get<UniversalResourceData>();
             var camera = cameraData.camera;
@@ -301,9 +344,10 @@ namespace ComputeTransparency
             }
 
             // 1. Sprites to screen space triangles.
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Setup", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassSetup, out var data))
             {
                 Common(builder, data, m_Settings.setupShader, m_KSetup);
+                data.timer = CTGpuTimers.Sampler(k_GroupSetup, k_PassSetup);
                 data.groups = new Vector3Int(DivUp(spriteCount, k_SetupGroup), 1, 1);
                 data.instances = builder.UseBuffer(instanceHandle, AccessFlags.Read);
                 data.sortedIndices = builder.UseBuffer(indexHandle, AccessFlags.Read);
@@ -327,14 +371,15 @@ namespace ComputeTransparency
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.Instances, (GraphicsBuffer)d.instances);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortedIndices, (GraphicsBuffer)d.sortedIndices);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.Triangles, (GraphicsBuffer)d.triangles);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
             // 2. Reset the per tile counters.
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Bin Clear", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassBinClear, out var data))
             {
                 Common(builder, data, m_Settings.binShader, m_KClear);
+                data.timer = CTGpuTimers.Sampler(k_GroupBin, k_PassBinClear);
                 data.groups = new Vector3Int(DivUp(Mathf.Max(segSlots, blockCount), k_ScanGroup), 1, 1);
                 data.tileSegCount = builder.UseBuffer(tileSegCountHandle, AccessFlags.Write);
                 data.blockSums = builder.UseBuffer(blockSumsHandle, AccessFlags.Write);
@@ -345,14 +390,15 @@ namespace ComputeTransparency
                     SetBinConstants(cmd, d);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileSegCount, (GraphicsBuffer)d.tileSegCount);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.BlockSums, (GraphicsBuffer)d.blockSums);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
             // 3. Count how many triangles overlap each tile.
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Bin Count", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassBinCount, out var data))
             {
                 Common(builder, data, m_Settings.binShader, m_KCount);
+                data.timer = CTGpuTimers.Sampler(k_GroupBin, k_PassBinCount);
                 data.groups = new Vector3Int(DivUp(triCount, k_BinGroup), 1, 1);
                 data.triangles = builder.UseBuffer(triHandle, AccessFlags.Read);
                 data.tileSegCount = builder.UseBuffer(tileSegCountHandle, AccessFlags.ReadWrite);
@@ -363,14 +409,15 @@ namespace ComputeTransparency
                     SetBinConstants(cmd, d);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.Triangles, (GraphicsBuffer)d.triangles);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileSegCount, (GraphicsBuffer)d.tileSegCount);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
             // 3b. Fold the per segment counts into the tile total and each segment's place in it.
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Bin Tile Totals", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassBinTotals, out var data))
             {
                 Common(builder, data, m_Settings.binShader, m_KTileTotals);
+                data.timer = CTGpuTimers.Sampler(k_GroupBin, k_PassBinTotals);
                 data.groups = new Vector3Int(DivUp(tileCount, k_ScanGroup), 1, 1);
                 data.tileSegCount = builder.UseBuffer(tileSegCountHandle, AccessFlags.ReadWrite);
                 data.tileSegBase = builder.UseBuffer(tileSegBaseHandle, AccessFlags.Write);
@@ -385,14 +432,15 @@ namespace ComputeTransparency
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileSegBase, (GraphicsBuffer)d.tileSegBase);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileCount, (GraphicsBuffer)d.tileCount);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileTotal, (GraphicsBuffer)d.tileTotal);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
             // 4. Prefix sum the (clamped) counts into pool offsets.
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Scan Blocks", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassScanBlocks, out var data))
             {
                 Common(builder, data, m_Settings.binShader, m_KScanBlocks);
+                data.timer = CTGpuTimers.Sampler(k_GroupBin, k_PassScanBlocks);
                 data.groups = new Vector3Int(Mathf.Max(blockCount, 1), 1, 1);
                 data.tileTotal = builder.UseBuffer(tileTotalHandle, AccessFlags.Read);
                 data.tileOffset = builder.UseBuffer(tileOffsetHandle, AccessFlags.Write);
@@ -405,13 +453,14 @@ namespace ComputeTransparency
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileTotal, (GraphicsBuffer)d.tileTotal);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileOffset, (GraphicsBuffer)d.tileOffset);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.BlockSums, (GraphicsBuffer)d.blockSums);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Scan Block Sums", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassScanBlockSums, out var data))
             {
                 Common(builder, data, m_Settings.binShader, m_KScanBlockSums);
+                data.timer = CTGpuTimers.Sampler(k_GroupBin, k_PassScanBlockSums);
                 data.groups = new Vector3Int(1, 1, 1);
                 data.blockSums = builder.UseBuffer(blockSumsHandle, AccessFlags.ReadWrite);
 
@@ -420,13 +469,14 @@ namespace ComputeTransparency
                     var cmd = ctx.cmd;
                     SetBinConstants(cmd, d);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.BlockSums, (GraphicsBuffer)d.blockSums);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Scan Add", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassScanAdd, out var data))
             {
                 Common(builder, data, m_Settings.binShader, m_KScanAdd);
+                data.timer = CTGpuTimers.Sampler(k_GroupBin, k_PassScanAdd);
                 data.groups = new Vector3Int(DivUp(tileCount, k_ScanGroup), 1, 1);
                 data.tileOffset = builder.UseBuffer(tileOffsetHandle, AccessFlags.ReadWrite);
                 data.blockSums = builder.UseBuffer(blockSumsHandle, AccessFlags.Read);
@@ -437,14 +487,15 @@ namespace ComputeTransparency
                     SetBinConstants(cmd, d);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileOffset, (GraphicsBuffer)d.tileOffset);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.BlockSums, (GraphicsBuffer)d.blockSums);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
             // 4b. Give each segment its absolute sub-slice and aim its scatter cursor at it.
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Bin Segment Bases", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassSegBase, out var data))
             {
                 Common(builder, data, m_Settings.binShader, m_KSegBase);
+                data.timer = CTGpuTimers.Sampler(k_GroupBin, k_PassSegBase);
                 data.groups = new Vector3Int(DivUp(tileCount, k_ScanGroup), 1, 1);
                 data.tileOffset = builder.UseBuffer(tileOffsetHandle, AccessFlags.Read);
                 data.tileTotal = builder.UseBuffer(tileTotalHandle, AccessFlags.Read);
@@ -461,14 +512,15 @@ namespace ComputeTransparency
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileEnd, (GraphicsBuffer)d.tileEnd);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileSegBase, (GraphicsBuffer)d.tileSegBase);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileSegCursor, (GraphicsBuffer)d.tileSegCursor);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
             // 5. Write the triangle indices into each tile's slice of the pool.
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Bin Scatter", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassScatter, out var data))
             {
                 Common(builder, data, m_Settings.binShader, m_KScatter);
+                data.timer = CTGpuTimers.Sampler(k_GroupBin, k_PassScatter);
                 data.groups = new Vector3Int(DivUp(triCount, k_BinGroup), 1, 1);
                 data.triangles = builder.UseBuffer(triHandle, AccessFlags.Read);
                 data.tileSegCount = builder.UseBuffer(tileSegCountHandle, AccessFlags.Read);
@@ -485,14 +537,15 @@ namespace ComputeTransparency
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileSegBase, (GraphicsBuffer)d.tileSegBase);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileSegCursor, (GraphicsBuffer)d.tileSegCursor);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.TileList, (GraphicsBuffer)d.tileList);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
             // 6. Shade every tile front to back.
-            using (var builder = renderGraph.AddComputePass<ComputePassData>("CT Raster", out var data))
+            using (var builder = renderGraph.AddComputePass<ComputePassData>(k_PassRaster, out var data))
             {
                 Common(builder, data, m_Settings.rasterShader, rasterKernel);
+                data.timer = CTGpuTimers.Sampler(k_GroupRaster, k_PassRaster);
                 data.groups = new Vector3Int(tilesX, tilesY, 1);
                 data.triangles = builder.UseBuffer(triHandle, AccessFlags.Read);
                 data.tileCount = builder.UseBuffer(tileCountHandle, AccessFlags.Read);
@@ -505,6 +558,7 @@ namespace ComputeTransparency
                 data.reversedZ = SystemInfo.usesReversedZBuffer ? 1 : 0;
                 data.depthTest = depthTest ? 1 : 0;
                 data.epsilon = m_Settings.epsilon;
+                data.untextured = m_Settings.textures ? 0 : 1;
                 data.debugMode = (int)m_Settings.debugMode;
                 data.debugRange = m_Settings.debugRange;
                 data.sceneDepth = sceneDepth;
@@ -518,6 +572,7 @@ namespace ComputeTransparency
                     cmd.SetComputeIntParam(d.shader, ShaderIds.ReversedZ, d.reversedZ);
                     cmd.SetComputeIntParam(d.shader, ShaderIds.DepthTestEnabled, d.depthTest);
                     cmd.SetComputeFloatParam(d.shader, ShaderIds.Epsilon, d.epsilon);
+                    cmd.SetComputeIntParam(d.shader, ShaderIds.Untextured, d.untextured);
                     cmd.SetComputeIntParam(d.shader, ShaderIds.DebugMode, d.debugMode);
                     cmd.SetComputeFloatParam(d.shader, ShaderIds.DebugRange, d.debugRange);
                     cmd.SetComputeIntParam(d.shader, ShaderIds.SegmentCount, d.segmentCount);
@@ -532,14 +587,15 @@ namespace ComputeTransparency
                     if (d.depthTest != 0)
                         cmd.SetComputeTextureParam(d.shader, d.kernel, ShaderIds.SceneDepth, d.sceneDepth);
                     cmd.SetComputeTextureParam(d.shader, d.kernel, ShaderIds.Result, d.result);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+                    Dispatch(cmd, d);
                 });
             }
 
             // 7. Blend the accumulated colour over the camera target.
-            using (var builder = renderGraph.AddRasterRenderPass<CompositePassData>("CT Composite", out var data))
+            using (var builder = renderGraph.AddRasterRenderPass<CompositePassData>(k_PassComposite, out var data))
             {
                 builder.AllowPassCulling(false);
+                data.timer = CTGpuTimers.Sampler(k_GroupComposite, k_PassComposite);
                 data.source = resultHandle;
                 builder.UseTexture(resultHandle, AccessFlags.Read);
                 data.material = m_CompositeMaterial;
@@ -547,7 +603,13 @@ namespace ComputeTransparency
 
                 builder.SetRenderFunc((CompositePassData d, RasterGraphContext ctx) =>
                 {
+                    if (d.timer != null)
+                        ctx.cmd.BeginSample(d.timer);
+
                     Blitter.BlitTexture(ctx.cmd, d.source, new Vector4(1, 1, 0, 0), d.material, 0);
+
+                    if (d.timer != null)
+                        ctx.cmd.EndSample(d.timer);
                 });
             }
         }
@@ -591,9 +653,10 @@ namespace ComputeTransparency
                 return data;
             }
 
-            using (var builder = renderGraph.AddComputePass<SortPassData>("CT Sort Prepare", out var data))
+            using (var builder = renderGraph.AddComputePass<SortPassData>(k_PassSortPrepare, out var data))
             {
                 Common(builder, data, m_KSortPrepare, DivUp(m_Sorter.PaddedCount, CTRadixSorter.GroupSize));
+                data.timer = CTGpuTimers.Sampler(k_GroupSort, k_PassSortPrepare);
                 data.instances = builder.UseBuffer(instances, AccessFlags.Read);
                 data.keysIn = builder.UseBuffer(keysA, AccessFlags.Write);
                 data.valuesIn = builder.UseBuffer(valuesA, AccessFlags.Write);
@@ -609,10 +672,13 @@ namespace ComputeTransparency
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.Instances, (GraphicsBuffer)d.instances);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortKeysIn, (GraphicsBuffer)d.keysIn);
                     cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortValuesIn, (GraphicsBuffer)d.valuesIn);
-                    cmd.DispatchCompute(d.shader, d.kernel, d.groups, 1, 1);
+                    Dispatch(cmd, d, d.groups);
                 });
             }
 
+            // The radix passes reuse one sampler each, so a sort timer reports the total across
+            // all of them rather than one. That is the number worth having: the question is what
+            // the sort costs, not what a quarter of it costs.
             for (int pass = 0; pass < CTRadixSorter.PassCount; pass++)
             {
                 // Ping-pong. PassCount is even, so the last pass lands back in the A buffers.
@@ -623,9 +689,10 @@ namespace ComputeTransparency
                 var valuesOut = even ? valuesB : valuesA;
                 int shift = pass * CTRadixSorter.BitsPerPass;
 
-                using (var builder = renderGraph.AddComputePass<SortPassData>("CT Sort Count", out var data))
+                using (var builder = renderGraph.AddComputePass<SortPassData>(k_PassSortCount, out var data))
                 {
                     Common(builder, data, m_KSortCount, m_Sorter.BlockCount);
+                    data.timer = CTGpuTimers.Sampler(k_GroupSort, k_PassSortCount);
                     data.shift = shift;
                     data.keysIn = builder.UseBuffer(keysIn, AccessFlags.Read);
                     data.histogram = builder.UseBuffer(histogram, AccessFlags.Write);
@@ -636,13 +703,14 @@ namespace ComputeTransparency
                         SetSortConstants(cmd, d);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortKeysIn, (GraphicsBuffer)d.keysIn);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortHistogram, (GraphicsBuffer)d.histogram);
-                        cmd.DispatchCompute(d.shader, d.kernel, d.groups, 1, 1);
+                        Dispatch(cmd, d, d.groups);
                     });
                 }
 
-                using (var builder = renderGraph.AddComputePass<SortPassData>("CT Sort Scan Blocks", out var data))
+                using (var builder = renderGraph.AddComputePass<SortPassData>(k_PassSortScanBlocks, out var data))
                 {
                     Common(builder, data, m_KSortScanBlocks, m_Sorter.ScanGroupCount);
+                    data.timer = CTGpuTimers.Sampler(k_GroupSort, k_PassSortScanBlocks);
                     data.shift = shift;
                     data.histogram = builder.UseBuffer(histogram, AccessFlags.ReadWrite);
                     data.blockSums = builder.UseBuffer(blockSums, AccessFlags.Write);
@@ -653,13 +721,14 @@ namespace ComputeTransparency
                         SetSortConstants(cmd, d);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortHistogram, (GraphicsBuffer)d.histogram);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortBlockSums, (GraphicsBuffer)d.blockSums);
-                        cmd.DispatchCompute(d.shader, d.kernel, d.groups, 1, 1);
+                        Dispatch(cmd, d, d.groups);
                     });
                 }
 
-                using (var builder = renderGraph.AddComputePass<SortPassData>("CT Sort Scan Block Sums", out var data))
+                using (var builder = renderGraph.AddComputePass<SortPassData>(k_PassSortScanBlockSums, out var data))
                 {
                     Common(builder, data, m_KSortScanBlockSums, 1);
+                    data.timer = CTGpuTimers.Sampler(k_GroupSort, k_PassSortScanBlockSums);
                     data.shift = shift;
                     data.blockSums = builder.UseBuffer(blockSums, AccessFlags.ReadWrite);
 
@@ -668,13 +737,14 @@ namespace ComputeTransparency
                         var cmd = ctx.cmd;
                         SetSortConstants(cmd, d);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortBlockSums, (GraphicsBuffer)d.blockSums);
-                        cmd.DispatchCompute(d.shader, d.kernel, 1, 1, 1);
+                        Dispatch(cmd, d, 1);
                     });
                 }
 
-                using (var builder = renderGraph.AddComputePass<SortPassData>("CT Sort Scan Add", out var data))
+                using (var builder = renderGraph.AddComputePass<SortPassData>(k_PassSortScanAdd, out var data))
                 {
                     Common(builder, data, m_KSortScanAdd, m_Sorter.ScanGroupCount);
+                    data.timer = CTGpuTimers.Sampler(k_GroupSort, k_PassSortScanAdd);
                     data.shift = shift;
                     data.histogram = builder.UseBuffer(histogram, AccessFlags.ReadWrite);
                     data.blockSums = builder.UseBuffer(blockSums, AccessFlags.Read);
@@ -685,13 +755,14 @@ namespace ComputeTransparency
                         SetSortConstants(cmd, d);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortHistogram, (GraphicsBuffer)d.histogram);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortBlockSums, (GraphicsBuffer)d.blockSums);
-                        cmd.DispatchCompute(d.shader, d.kernel, d.groups, 1, 1);
+                        Dispatch(cmd, d, d.groups);
                     });
                 }
 
-                using (var builder = renderGraph.AddComputePass<SortPassData>("CT Sort Scatter", out var data))
+                using (var builder = renderGraph.AddComputePass<SortPassData>(k_PassSortScatter, out var data))
                 {
                     Common(builder, data, m_KSortScatter, m_Sorter.BlockCount);
+                    data.timer = CTGpuTimers.Sampler(k_GroupSort, k_PassSortScatter);
                     data.shift = shift;
                     data.keysIn = builder.UseBuffer(keysIn, AccessFlags.Read);
                     data.valuesIn = builder.UseBuffer(valuesIn, AccessFlags.Read);
@@ -708,7 +779,7 @@ namespace ComputeTransparency
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortKeysOut, (GraphicsBuffer)d.keysOut);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortValuesOut, (GraphicsBuffer)d.valuesOut);
                         cmd.SetComputeBufferParam(d.shader, d.kernel, ShaderIds.SortHistogram, (GraphicsBuffer)d.histogram);
-                        cmd.DispatchCompute(d.shader, d.kernel, d.groups, 1, 1);
+                        Dispatch(cmd, d, d.groups);
                     });
                 }
             }
@@ -767,6 +838,33 @@ namespace ComputeTransparency
                 case 32: return 3;
                 default: return -1;
             }
+        }
+
+        /// <summary>
+        /// Dispatches, timed if the GPU timers are on. The sample brackets the dispatch alone and
+        /// not the parameter binding above it, so the number is the hardware's time in the kernel
+        /// rather than the cost of recording the pass.
+        /// </summary>
+        static void Dispatch(ComputeCommandBuffer cmd, ComputePassData d)
+        {
+            if (d.timer != null)
+                cmd.BeginSample(d.timer);
+
+            cmd.DispatchCompute(d.shader, d.kernel, d.groups.x, d.groups.y, d.groups.z);
+
+            if (d.timer != null)
+                cmd.EndSample(d.timer);
+        }
+
+        static void Dispatch(ComputeCommandBuffer cmd, SortPassData d, int groupsX)
+        {
+            if (d.timer != null)
+                cmd.BeginSample(d.timer);
+
+            cmd.DispatchCompute(d.shader, d.kernel, groupsX, 1, 1);
+
+            if (d.timer != null)
+                cmd.EndSample(d.timer);
         }
 
         static int DivUp(int value, int divisor) => (value + divisor - 1) / divisor;

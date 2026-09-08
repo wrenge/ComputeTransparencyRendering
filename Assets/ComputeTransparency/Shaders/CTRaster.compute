@@ -34,6 +34,7 @@ float4 _CTScreenSize;   // xy = pixels, zw = 1/pixels
 uint   _CTReversedZ;
 uint   _CTDepthTestEnabled;
 float  _CTEpsilon;        // transmittance cutoff, from the renderer feature
+uint   _CTUntextured;     // 1 skips the atlas sample; 0, the default, is normal shading
 uint   _CTDebugMode;      // CT_DEBUG_*, from the renderer feature
 float  _CTDebugRange;     // count mapped to the top of the heat ramp
 uint   _CTSegmentCount;   // active segments, 1 .. CT_MAX_SEGMENTS
@@ -258,7 +259,16 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
                 }
 
                 float2 uv = b0 * uv0 + b1 * uv1 + b2 * uv2;
-                float4 texel = _CTAtlas.SampleLevel(sampler_CTAtlas, float3(uv, t.payload.y), t.zLod.w);
+
+                // Group uniform branch, so no lane diverges and the sample is simply not issued.
+                // Note what this does to the alpha: without the texture every sprite is opaque to
+                // the extent its tint says, so transmittance falls faster and the early-out fires
+                // sooner. It is not a clean isolation of what sampling costs on its own - watch
+                // the Walk Length view alongside it.
+                float4 texel = 1.0;
+                if (!_CTUntextured)
+                    texel = _CTAtlas.SampleLevel(sampler_CTAtlas, float3(uv, t.payload.y), t.zLod.w);
+
                 float4 src = texel * CTUnpackColor(t.payload.x);
 
                 accum += transmittance * src.a * src.rgb;

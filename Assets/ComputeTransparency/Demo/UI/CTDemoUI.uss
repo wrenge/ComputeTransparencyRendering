@@ -81,3 +81,106 @@
     color: rgb(140, 148, 162);
     white-space: normal;
 }
+
+/* Two pages, one at a time. The timer list is seventeen rows and does not fit under the controls
+   on a phone; giving it a page of its own is what makes it readable rather than a scrap of scroll
+   area at the bottom of the panel. */
+.ct-tabs {
+    flex-direction: row;
+    margin-bottom: 10px;
+}
+
+.ct-tab {
+    flex-grow: 1;
+    height: 24px;
+    margin: 0 2px 0 0;
+    padding: 0 8px;
+    border-width: 0;
+    border-radius: 5px;
+    background-color: rgb(30, 34, 42);
+    color: rgb(160, 168, 182);
+}
+
+.ct-tab:hover {
+    background-color: rgb(43, 48, 59);
+}
+
+.ct-tab-active {
+    background-color: rgb(58, 65, 79);
+    color: rgb(255, 255, 255);
+    -unity-font-style: bold;
+}
+
+/* The toggle's own label is empty - the row carries it - so only the check mark needs placing. */
+.ct-toggle {
+    margin: 0;
+    flex-grow: 0;
+}
+
+/* Per pass GPU times. Two columns rather than padded text: the default theme font is
+   proportional, so spaces would not line the numbers up. */
+.ct-timers {
+    margin-top: 4px;
+}
+
+/* No fixed row height and no overflow clip: a 15px row is shorter than an 11px line box in this
+   theme, which cut the top and bottom off every glyph. The rows size to their text instead. */
+.ct-timer-row {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 1px;
+}
+
+/* The theme gives Label its own margin, which at seventeen rows is enough to push the last three
+   under the scroll. The rows are dense on purpose; the text still sizes itself. */
+.ct-timer-name {
+    flex-grow: 1;
+    flex-shrink: 1;
+    margin: 0;
+    padding: 0;
+    font-size: 11px;
+    color: rgb(160, 168, 182);
+    -unity-text-align: middle-left;
+}
+
+.ct-timer-value {
+    flex-grow: 0;
+    flex-shrink: 0;
+    width: 62px;
+    margin: 0;
+    padding: 0;
+    font-size: 11px;
+    color: rgb(226, 231, 240);
+    -unity-text-align: middle-right;
+}
+
+/* A pass that did not run this frame, rather than one that ran and cost nothing. */
+.ct-timer-idle > .ct-timer-name,
+.ct-timer-idle > .ct-timer-value {
+    color: rgb(104, 111, 124);
+}
+
+.ct-timer-separator {
+    height: 1px;
+    margin: 3px 0;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.ct-timer-total > .ct-timer-name,
+.ct-timer-total > .ct-timer-value {
+    -unity-font-style: bold;
+    color: rgb(255, 255, 255);
+}
+
+/* On its own page the whole list fits - seventeen rows is about 260px - so this cap only bites if
+   more passes are ever added. The total sits above it either way and stays on screen. */
+.ct-timer-scroll {
+    max-height: 420px;
+}
+
+.ct-timers-note {
+    font-size: 10px;
+    color: rgb(140, 148, 162);
+    white-space: normal;
+    margin-top: 4px;
+}

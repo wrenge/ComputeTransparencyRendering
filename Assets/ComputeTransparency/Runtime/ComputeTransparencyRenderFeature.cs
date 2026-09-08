@@ -100,6 +100,13 @@ namespace ComputeTransparency
                      "the main thread out of it entirely.")]
             public CTSortMode sortMode = CTSortMode.Cpu;
 
+            [Tooltip("Sample the sprite atlas. Turning it off shades from the tint alone, on both " +
+                     "renderers at once, which is what makes the comparison still mean something.\n\n" +
+                     "It is not a clean measure of what sampling costs: without the texture's alpha " +
+                     "every sprite is as opaque as its tint, so transmittance falls faster and the " +
+                     "early-out fires sooner. Read it next to the Walk Length view.")]
+            public bool textures = true;
+
             public RenderPassEvent renderPassEvent = RenderPassEvent.BeforeRenderingTransparents;
 
             [Header("Debug")]
@@ -111,6 +118,14 @@ namespace ComputeTransparency
                      "views. Anything above it clamps to red.")]
             [Range(1f, 512f)]
             public float debugRange = 32f;
+
+            [Tooltip("Wrap every dispatch in a GPU timestamp query and report the per pass cost. " +
+                     "This is the only way to see which stage the frame is actually spent in - " +
+                     "wall clock bundles the CPU gather, the GPU and the editor together.\n\n" +
+                     "Off by default: timestamp queries cost something themselves, and on a tile " +
+                     "based GPU they can split work that would otherwise batch, so the numbers are " +
+                     "for finding the expensive pass and not for quoting as the renderer's cost.")]
+            public bool gpuTimers;
 
             [Header("Shaders")]
             public ComputeShader setupShader;
@@ -125,6 +140,11 @@ namespace ComputeTransparency
         }
 
         public Settings settings = new Settings();
+
+        // Global rather than a material property: the hardware baseline is drawn immediate mode
+        // from CTInstancedSpriteBatch and the compute path from this pass, and the two have to
+        // switch together or an A/B between them measures the switch instead of the renderers.
+        static readonly int s_UntexturedId = Shader.PropertyToID("_CTUntextured");
 
         ComputeTransparencyPass m_Pass;
         CTTraditionalOverdrawPass m_OverdrawPass;
@@ -157,6 +177,10 @@ namespace ComputeTransparency
             if (renderingData.cameraData.cameraType == CameraType.Preview ||
                 renderingData.cameraData.cameraType == CameraType.Reflection)
                 return;
+
+            // The sense is inverted so that an unset global - a scene with this feature disabled,
+            // or the frames before it first runs - reads 0 and shades normally.
+            Shader.SetGlobalFloat(s_UntexturedId, settings.textures ? 0f : 1f);
 
             if (m_OverdrawPass != null && CTTraditionalOverdrawPass.Armed)
                 renderer.EnqueuePass(m_OverdrawPass);

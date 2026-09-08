@@ -1020,3 +1020,140 @@ untextured the atlas is the problem and the report says which failure it hit; if
 path is, the fault is in how the compute pass binds the array, which it does on the ComputeShader
 asset rather than through the command buffer because importing the array as an RTHandle binds it
 as a plain 2D target and the array sampler comes back empty.
+
+## Work log — per pass GPU timers
+
+The first item on the list from the investigation above: every number in this document so far is
+whole frame wall clock, which bundles the CPU gather, the GPU work and the editor's overhead into
+one figure and cannot say which of the eleven dispatches the frame went into. The only genuine per
+pass number ever recorded here is the 78% on `CSRaster16` from a one-off Xcode capture.
+
+### What was added
+
+`CTGpuTimers` is a registry of `CustomSampler`s created with `collectGpuData: true`. Every dispatch
+in `ComputeTransparencyPass` now goes through a `Dispatch` helper that brackets it in
+`BeginSample`/`EndSample`, and the composite blit is bracketed the same way. Seventeen timers:
+setup, the six radix sort passes, the eight bin passes, raster, composite.
+
+Three details worth recording:
+
+- **The sample brackets the dispatch alone**, not the parameter binding above it, so the number is
+  the hardware's time in the kernel rather than the cost of recording the pass.
+- **The four radix passes share one sampler each**, so a sort row reports the total across all four
+  rather than a quarter of it. That is the number the question needs.
+- **`gpuSampleBlockCount`, not the nanoseconds, is the validity signal.** A pass that did not run
+  this frame and a platform with no GPU timing both report zero nanoseconds; without the block
+  count an idle pass would drag its own average towards zero. This is what makes the sort rows go
+  blank rather than reading 0.000 in `Cpu` mode.
+
+Off by default (`gpuTimers` on the renderer feature). Timestamp queries are not free and on a tile
+based GPU can split work that would otherwise batch, so this finds the expensive pass; it does not
+quote the renderer's cost.
+
+### In the demo panel
+
+The panel now has two pages behind tabs under the title. Seventeen rows will not share a panel with
+the controls - the first attempt put them in a 210px scroll area at the bottom and the rows were
+effectively invisible - so Timers is a page of its own: the `GPU timers` toggle, the total, and the
+per pass list in dispatch order grouped by stage. Values redraw at 5 Hz over an exponential moving
+average, and only while that page is showing; the readings are a few frames late by nature, because
+the CPU runs ahead of the GPU.
+
+Two layout faults on the way there, both of which only a measurement catches:
+
+- **A fixed `height: 15px` on the row, with `overflow: hidden` on the name.** At `font-size: 11px`
+  the line box in this theme is taller than that, so every glyph in the list was cut off top and
+  bottom. Rows size to their text now.
+- **The theme's own Label margin**, which at seventeen rows added enough to push the last three
+  under the scroll. Zeroed on the two row labels.
+
+Verified by layout in play mode rather than by eye, which is what found both: every label in the
+panel measured with `MeasureTextSize` at the width it actually got, against its `contentRect`.
+**39 labels, 0 clipped**; 17 rows, all 17 fully in view, content 273.5px inside a 420px cap so
+nothing scrolls; Controls page 420px, Timers page 511px.
+
+A note on testing this: the panel caches its controls in `OnEnable`, so reimporting the UXML or USS
+while play mode is running leaves `CTDemoUI` writing into a detached visual tree - rows appear to
+vanish and the list reads empty. That is the test setup, not the panel. Restart play mode after
+touching the layout files.
+
+### The result on this machine: nothing, and it is not the wiring
+
+**Metal in the editor reports no GPU timings at all.** Verified in play mode on the demo scene:
+
+| | |
+|---|---|
+| samplers created | 17 of 17, all valid |
+| CPU side | `CT Raster` cpuBlocks 4, `CT Sort Count` cpuBlocks 16 (4 passes x 4 cameras) |
+| GPU side | `gpuSampleBlockCount` 0, `gpuElapsedNanoseconds` 0, every pass |
+
+So the samplers really are in the command buffer and really are being entered. The control that
+settles it: Unity's own `Camera.Render` marker, with its recorder explicitly enabled, reports
+`cpuBlocks=2` and `gpuBlocks=0` in the same session. `ProfilerDriver.profileGPU = true` changes
+nothing. This is the backend, not this code.
+
+The panel says so rather than showing a column of dashes: after a three second grace period
+`CTGpuTimers.Silent` goes true, the note names the graphics API and points at the external tool,
+and a warning goes to the console once.
+
+### What this means for the plan
+
+The measurement the whole plan was waiting on is still not available on the development machine.
+Where the timers can be expected to work is Vulkan on the Android device, which is the platform the
+premise is about anyway - but that is untested, and the honest state is "wired, verified as far as
+the platform allows, unverified where it counts".
+
+So the order stands, with the first step now concrete:
+
+1. Run the demo as a development build on the S23 with the timers on. Either the rows fill in, and
+   the per pass breakdown finally exists, or they do not and every future measurement here has to
+   come from Snapdragon Profiler or AGI.
+2. Part A of the setup hoist (winding, degenerate reject, `invArea` out of the per pixel loop).
+   Bit-identical, verifiable with the existing harness, does not depend on the timers.
+3. Edge based tile reject in `CTBin` plus the edge coefficient form, together. Both want the same
+   `CTTri` change, and it grows the struct 80 to 112 bytes, which is exactly the trade the timers
+   were supposed to arbitrate.
+
+## Work log — a switch for the atlas sample
+
+`textures` on the renderer feature, and a `Textures` toggle on the demo panel's Controls page.
+Off, neither renderer samples the atlas and both shade from the tint alone.
+
+**Both paths, from one place.** The compute rasterizer is driven by a uniform on the raster kernel,
+the hardware baseline by a global shader float, and both come from the same setting, pushed once per
+camera in `AddRenderPasses`. A switch that reached only one of them would turn every A/B in this
+document into a comparison of the switch. The compute shader needs its own `SetComputeIntParam`
+because a `ComputeShader` does not read globals set with `Shader.SetGlobalFloat`.
+
+**The sense is inverted in the shaders** — `_CTUntextured`, not `_CTTextured`. An unset global reads
+0, and 0 has to mean ordinary shading, otherwise a scene with this feature disabled, or the frames
+before it first runs, would render untextured with nothing to explain it.
+
+**What it is not.** Not a clean isolation of what sampling costs. Without the texture's alpha every
+sprite is as opaque as its tint, so transmittance falls faster and the early-out fires sooner - the
+compute path changes both its shading cost *and* its walk length at once. Read it next to the Walk
+Length view, which shows the second effect directly. The tooltip says so.
+
+The branch in the raster kernel is on a uniform, so no lane diverges and the sample is simply not
+issued; the barycentrics are still computed because the depth test needs them.
+
+### Verification
+
+Play mode, 10000 sprites, camera frozen:
+
+| | luma | coverage |
+|---|------|----------|
+| compute, textures on | 0.48918 | 0.8312 |
+| compute, textures off | 0.52046 | 0.8462 |
+| traditional, textures on | 0.58663 | 0.9538 |
+| traditional, textures off | 0.59921 | 0.9623 |
+
+Both paths respond, and in the same direction: brighter and covering more, which is what losing the
+disc's alpha ramp does. The two blocks are not comparable to each other - the compute rows come from
+a render texture and the traditional rows from a screen capture that includes the UI panel - because
+of the trap already recorded in this document: `cam.Render()` into a probe target does not see an
+immediate mode `RenderMeshInstanced` draw, so the hardware path measured 0.003 luma that way. Its
+numbers come from `ScreenCapture.CaptureScreenshotAsTexture`, which reads the real frame.
+
+The compute path moves more than the baseline does, which is the early-out shifting as well as the
+shading - exactly the confound noted above, visible in the numbers.
