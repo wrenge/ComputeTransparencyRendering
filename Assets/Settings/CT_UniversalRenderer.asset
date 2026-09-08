@@ -73,10 +73,11 @@ MonoBehaviour:
     tileSize: 16
     binSegments: 4
     averagePrimitivesPerTile: 1024
+    tileReject: 1
     depthTest: 1
     epsilon: 0.075
-    sortMode: 0
-    textures: 0
+    sortMode: 1
+    textures: 1
     renderPassEvent: 450
     debugMode: 0
     debugRange: 64
