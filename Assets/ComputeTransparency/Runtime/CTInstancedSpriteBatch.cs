@@ -88,6 +88,7 @@ namespace ComputeTransparency
 
         Mesh m_Quad;
         Material m_Material;
+        LocalKeyword m_UntexturedKeyword;
         int m_Count;
         int m_Version;
 
@@ -147,6 +148,14 @@ namespace ComputeTransparency
         /// <summary>Skip the draw without disposing the batch.</summary>
         public bool Enabled { get; set; } = true;
 
+        /// <summary>
+        /// Drop the atlas sample and shade from the tint alone. Set by
+        /// <see cref="ComputeTransparencyRenderFeature"/> from the same setting that drives the
+        /// compute rasterizer, so an A/B between the two paths never measures the switch itself.
+        /// Static because the feature has no reference to any batch: batches register themselves.
+        /// </summary>
+        public static bool Untextured { get; set; }
+
         /// <summary>Extra offset applied to every sprite, used when both paths are shown side by side.</summary>
         public Vector3 Offset { get; set; }
 
@@ -182,6 +191,8 @@ namespace ComputeTransparency
 
             if (atlas != null)
                 m_Material.SetTexture("_BaseMap", atlas.Texture);
+
+            m_UntexturedKeyword = new LocalKeyword(m_Material.shader, "CT_UNTEXTURED");
         }
 
         /// <summary>
@@ -203,6 +214,13 @@ namespace ComputeTransparency
 
             if (m_Material == null)
                 return;
+
+            // On the material, not on the global keyword state. The renderer feature can only set
+            // a global while the render loop is running, and a global set from there does not stick
+            // - it reads back off on the next frame, and the baseline never switches. The material
+            // is this batch's own clone, so writing to it here is unambiguous and frame ordered.
+            if (m_UntexturedKeyword.isValid)
+                m_Material.SetKeyword(m_UntexturedKeyword, Untextured);
 
             var cameraTransform = camera.transform;
 

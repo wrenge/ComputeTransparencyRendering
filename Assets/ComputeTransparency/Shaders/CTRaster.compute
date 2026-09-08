@@ -14,6 +14,19 @@
 #pragma kernel CSRaster16
 #pragma kernel CSRaster32
 
+// Three choices that are fixed for the whole dispatch, compiled in rather than branched on. The
+// branches themselves were uniform and nearly free; what they cost was everything the compiler had
+// to keep alive for the path not taken - the debug counters above all, which are incremented in the
+// innermost loop and live across the entire walk purely to feed the debug views. Register pressure
+// is not hypothetical here: CSRaster32 asks for 1024 threads and already trips the compiler's
+// budget warning.
+//
+// Eight combinations times four tile sizes is thirty two compiled kernels. That is the price, and
+// it is worth watching if more keywords are ever added to this file.
+#pragma multi_compile _ CT_DEBUG
+#pragma multi_compile _ CT_DEPTH_TEST
+#pragma multi_compile _ CT_UNTEXTURED
+
 #include "CTCommon.hlsl"
 
 StructuredBuffer<CTTri> _CTTriangles;
@@ -31,11 +44,9 @@ RWTexture2D<float4> _CTResult;   // rgb = accumulated colour, a = remaining tran
 
 uint4  _CTTileParams;   // x = tilesX, y = tilesY, z = tileCount, w = block count
 float4 _CTScreenSize;   // xy = pixels, zw = 1/pixels
-uint   _CTReversedZ;
-uint   _CTDepthTestEnabled;
+uint   _CTReversedZ;      // a platform constant, so it stays a uniform rather than a ninth variant
 float  _CTEpsilon;        // transmittance cutoff, from the renderer feature
-uint   _CTUntextured;     // 1 skips the atlas sample; 0, the default, is normal shading
-uint   _CTDebugMode;      // CT_DEBUG_*, from the renderer feature
+uint   _CTDebugMode;      // which CT_DEBUG_* view, inside the CT_DEBUG variant
 float  _CTDebugRange;     // count mapped to the top of the heat ramp
 uint   _CTSegmentCount;   // active segments, 1 .. CT_MAX_SEGMENTS
 
@@ -75,6 +86,7 @@ bool EdgeAccept(float w, float2 dir)
     return (dir.y > 0.0) || (dir.y == 0.0 && dir.x < 0.0);
 }
 
+#ifdef CT_DEBUG
 // What the debug views draw. Alpha is written as 0 by the caller so the composite pass
 // replaces the frame rather than blending over it.
 float3 DebugColor(uint shaded, float transmittance, uint rawCount, uint kept, uint walked)
@@ -107,6 +119,7 @@ float3 DebugColor(uint shaded, float transmittance, uint rawCount, uint kept, ui
     }
     return c;
 }
+#endif
 
 // Sorts the first n entries of gsList ascending. The sort key is the triangle index,
 // which is already the depth order, so sorting restores front to back after the
@@ -160,17 +173,25 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
     uint2 pixel = groupId.xy * tileSize + localId;
     bool onScreen = all(pixel < (uint2)_CTScreenSize.xy);
 
-    uint rawCount = _CTTileCount[tile];
     uint tileEnd = _CTTileEnd[tile];
-    uint tileStart = tileEnd;   // overwritten by the first segment, whose base is the tile's
 
     float3 accum = 0.0;
     float  transmittance = 1.0;
-    uint   shaded = 0;
-    uint   walked = 0;
+
+    // Debug only state. Outside the debug variant none of it exists, which is the point of the
+    // keyword: shaded is per pixel and incremented in the innermost loop, so as a runtime choice it
+    // would occupy a register across the whole walk in a kernel that has none to spare.
+#ifdef CT_DEBUG
+    uint rawCount = _CTTileCount[tile];
+    uint tileStart = tileEnd;   // overwritten by the first segment, whose base is the tile's
+    uint shaded = 0;
+    uint walked = 0;
+#endif
 
     float2 pt = (float2)pixel + 0.5;
-    float sceneDepth = _CTDepthTestEnabled ? _CTSceneDepth.Load(int3(pixel, 0)) : 0.0;
+#ifdef CT_DEPTH_TEST
+    float sceneDepth = _CTSceneDepth.Load(int3(pixel, 0));
+#endif
 
     // Segments are already in depth order, so they are walked in order and only the one being
     // walked is sorted. The bound is a compile time constant; segments the feature is not using
@@ -188,8 +209,10 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
             uint segIndex = tile * _CTSegmentCount + seg;
             count = _CTTileSegCount[segIndex];
             listBase = _CTTileSegBase[segIndex];
+#ifdef CT_DEBUG
             if (seg == 0)
                 tileStart = listBase;
+#endif
         }
 
         uint padded = NextPow2(count);
@@ -204,7 +227,9 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
 
         BitonicSortShared(padded, tid, tileThreads);
 
+#ifdef CT_DEBUG
         uint segWalked = 0;
+#endif
 
         // The walk is chunked so the outer loop bound is a compile time constant. A group sync
         // inside a loop whose trip count comes from memory is rejected by the shader compilers,
@@ -257,35 +282,38 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
                 float b1 = w1 * invArea;
                 float b2 = w2 * invArea;
 
-                if (_CTDepthTestEnabled)
-                {
-                    float depth = dot(float3(b0, b1, b2), z);
-                    bool occluded = _CTReversedZ ? (depth < sceneDepth) : (depth > sceneDepth);
-                    if (occluded)
-                        continue;
-                }
+#ifdef CT_DEPTH_TEST
+                float depth = dot(float3(b0, b1, b2), z);
+                bool occluded = _CTReversedZ ? (depth < sceneDepth) : (depth > sceneDepth);
+                if (occluded)
+                    continue;
+#endif
 
                 float2 uv = b0 * uv0 + b1 * uv1 + b2 * uv2;
 
-                // Group uniform branch, so no lane diverges and the sample is simply not issued.
-                // Note what this does to the alpha: without the texture every sprite is opaque to
-                // the extent its tint says, so transmittance falls faster and the early-out fires
-                // sooner. It is not a clean isolation of what sampling costs on its own - watch
-                // the Walk Length view alongside it.
-                float4 texel = 1.0;
-                if (!_CTUntextured)
-                    texel = _CTAtlas.SampleLevel(sampler_CTAtlas, float3(uv, t.payload.y), t.zLod.w);
-
+                // Note what dropping the sample does to the alpha: without the texture every
+                // sprite is opaque to the extent its tint says, so transmittance falls faster and
+                // the early-out fires sooner. It is not a clean isolation of what sampling costs on
+                // its own - watch the Walk Length view alongside it.
+#ifdef CT_UNTEXTURED
+                float4 src = CTUnpackColor(t.payload.x);
+#else
+                float4 texel = _CTAtlas.SampleLevel(sampler_CTAtlas, float3(uv, t.payload.y), t.zLod.w);
                 float4 src = texel * CTUnpackColor(t.payload.x);
+#endif
 
                 accum += transmittance * src.a * src.rgb;
                 transmittance *= (1.0 - src.a);
+#ifdef CT_DEBUG
                 // Counts the blends that actually happened, which is what the overdraw view is
                 // for: it stops climbing exactly where the early-out saved the work.
                 shaded++;
+#endif
             }
 
+#ifdef CT_DEBUG
             segWalked = min((c + 1) * CT_EARLY_OUT_STRIDE, count);
+#endif
 
             // Does any pixel in this tile still have transmittance left, and is there anything
             // left to draw? If not the whole tile is done and the group abandons the walk.
@@ -304,7 +332,9 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
                 break;
         }
 
+#ifdef CT_DEBUG
         walked += segWalked;
+#endif
 
         // Move on to the next segment only if some pixel can still take a contribution and this
         // tile has primitives past the end of this segment. Both terms are group uniform.
@@ -325,10 +355,11 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
 
     if (onScreen)
     {
-        if (_CTDebugMode == CT_DEBUG_NONE)
-            _CTResult[pixel] = float4(accum, transmittance);
-        else
-            _CTResult[pixel] = float4(DebugColor(shaded, transmittance, rawCount, tileEnd - tileStart, walked), 0.0);
+#ifdef CT_DEBUG
+        _CTResult[pixel] = float4(DebugColor(shaded, transmittance, rawCount, tileEnd - tileStart, walked), 0.0);
+#else
+        _CTResult[pixel] = float4(accum, transmittance);
+#endif
     }
 }
 

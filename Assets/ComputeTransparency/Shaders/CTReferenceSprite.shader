@@ -42,18 +42,14 @@ Shader "ComputeTransparency/Reference Sprite"
             #pragma fragment Frag
             #pragma require 2darray
             #pragma multi_compile_instancing
+            // Matches CT_UNTEXTURED on the compute rasterizer so both paths lose the sample
+            // together; a switch that reached only one of them would measure itself.
+            #pragma multi_compile _ CT_UNTEXTURED
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
             TEXTURE2D_ARRAY(_BaseMap);
             SAMPLER(sampler_BaseMap);
-
-            // Set globally by ComputeTransparencyRenderFeature so both paths switch together;
-            // comparing a textured baseline against an untextured compute path would measure
-            // nothing. Declared outside any cbuffer because it is a global, not a material
-            // property, and the sense is inverted on purpose: an unset global reads 0, which has
-            // to mean ordinary textured shading.
-            float _CTUntextured;
 
             struct Attributes
             {
@@ -105,11 +101,12 @@ Shader "ComputeTransparency/Reference Sprite"
             {
                 // The tint arrives already quantised to 8 bits per channel, exactly as the
                 // compute path unpacks its RGBA8, so both paths multiply by the same numbers.
-                float4 texel = 1.0;
-                if (_CTUntextured < 0.5)
-                    texel = SAMPLE_TEXTURE2D_ARRAY(_BaseMap, sampler_BaseMap, input.uv.xy, input.uv.z);
-
+#ifdef CT_UNTEXTURED
+                return input.color;
+#else
+                float4 texel = SAMPLE_TEXTURE2D_ARRAY(_BaseMap, sampler_BaseMap, input.uv.xy, input.uv.z);
                 return texel * input.color;
+#endif
             }
             ENDHLSL
         }

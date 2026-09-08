@@ -1355,3 +1355,84 @@ genuinely switching the compiled variant.
 two that read the keyword. They are small and this is the cheapest of the keyword conversions; the
 raster kernel, where the same treatment is worth much more, already has four variants for tile size
 and needs the variant count watched.
+
+## Work log — the remaining uniform branches as keywords
+
+Three more choices that are fixed for a whole dispatch, converted from uniforms to
+`#pragma multi_compile` in `CTRaster.compute`: `CT_DEBUG`, `CT_DEPTH_TEST`, `CT_UNTEXTURED`.
+`_CTReversedZ` is left as a uniform on purpose - it is a platform constant guarding one select
+inside the depth test path, and a fourth keyword would double the variant count to pay for it.
+
+### Why the debug one is the point
+
+The branches were uniform and nearly free. What they cost was everything the compiler had to keep
+alive for the path not taken, and the debug counters are the worst of it: `shaded` is per pixel and
+incremented in the innermost loop, so as a runtime choice it holds a register across the entire walk
+in a kernel that has none to spare. `walked`, `rawCount` and `tileStart` are group uniform and
+cheaper, but they are dead weight too. With `_CTDebugMode` a uniform, the final write also kept both
+the shaded result and the whole `DebugColor` computation live to the end of the kernel.
+
+The result is measurable and was measurable before any of the timing work: **`CSRaster32` no longer
+emits X4714**. That warning - "sum of temp registers and indexable temp registers times 1024 threads
+exceeds the recommended total 16384" - had been in this project's console since the beginning, and
+it is a statement about occupancy, not style. It is gone with the debug variant compiled as well as
+without, on tile 32, which is the heaviest kernel the project has.
+
+### `CT_DEPTH_TEST` also removes work the branch was hiding
+
+Without the keyword the triangle's device depths are still swapped by the winding fix and `z` is
+still live even when nothing reads it. Compiled out, the swap and the depth load both disappear.
+
+### The global keyword that would not stick
+
+The hardware baseline used `Shader.SetGlobalFloat` from `AddRenderPasses`, which worked. Replacing
+it with `Shader.SetKeyword(GlobalKeyword, bool)` from the same place did **not**: the keyword reads
+back off on the next frame and the baseline never switches. Confirmed twice, and the direct control
+is that the same call from an editor command works immediately - so the API is fine and the problem
+is calling it from inside the render loop.
+
+The fix moves the decision to something each side owns. `CTInstancedSpriteBatch` keeps its own
+material clone, so it sets the keyword on that material in `Render`, from a static the renderer
+feature writes each frame. The compute rasterizer sets its own local keyword on the shader asset
+while the graph records, as the bin shader already did. One setting, two owners, no global state.
+
+A second trap on the way: `GlobalKeyword.Create` throws when it runs while a `ScriptableObject` is
+still being constructed, and a renderer feature's `Create` is called from `OnEnable`, which is inside
+that window. The exception propagates out of `UniversalRendererData.Create` and takes the entire
+render pipeline asset down - the editor renders nothing and reports the failure as a Blitter error
+further down the stack. The global keyword is gone now, but the rule is worth keeping: keyword
+objects belong in `AddRenderPasses` or later, never in a feature's construction path.
+
+### Verified
+
+Camera frozen, 10000 sprites, panel masked. Every switch has to change what it claims to change, and
+the default configuration has to change nothing:
+
+| | result |
+|---|---|
+| default settings vs the image before the conversion | **0 differing scene pixels** |
+| compute, textures on vs off | luma 0.60587 to 0.62520 |
+| baseline, textures on vs off | luma 0.61315 to 0.62746 |
+| compute, depth test on vs off, alpha 0.9 | 0 differing pixels |
+| compute, depth test on vs off, alpha 0.06 | 5.85% of the scene, luma 0.58174 to 0.58687 |
+| Tile Load view | still draws, keyword tracked in both directions |
+
+The depth test row is the interesting one. At the demo's normal alpha, turning the depth test off
+changes nothing at all: the cloud is a hollow shell, the opaque core sits inside the hollow, and
+every pixel saturates on the near shell long before the walk reaches anything the core could have
+occluded. Thin the sprites until transmittance survives to the far side and the core's silhouette
+appears, 5.85% of the frame. The keyword works; at alpha 0.9 the early-out gets there first, which
+is the entire premise of this renderer showing up in a test that was meant to measure something else.
+
+Keyword state was also read back off the shader assets directly (`IsKeywordEnabled`) and tracks the
+settings in both directions, which is what distinguishes a working switch from one stuck on.
+
+### The cost
+
+`CTRaster.compute` is now four tile sizes times eight keyword combinations: **32 compiled kernels**,
+up from four. Reimport of both shader files takes 0.23s here, so the editor cost is nothing, but this
+is the file to watch: a fourth keyword would make it 64. If it ever comes to that, the answer is not
+another `multi_compile` but explicit `#pragma kernel` entry points, which this file already uses for
+the tile size - `RasterTile` is an inlined function taking the size as a literal, and a compile time
+argument for anything else would specialize it the same way while enumerating exactly the
+combinations that are wanted.

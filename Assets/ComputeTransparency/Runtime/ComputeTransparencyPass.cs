@@ -74,9 +74,7 @@ namespace ComputeTransparency
             public static readonly int TriCount = Shader.PropertyToID("_CTTriCount");
             public static readonly int TileListCapacity = Shader.PropertyToID("_CTTileListCapacity");
             public static readonly int ReversedZ = Shader.PropertyToID("_CTReversedZ");
-            public static readonly int DepthTestEnabled = Shader.PropertyToID("_CTDepthTestEnabled");
             public static readonly int Epsilon = Shader.PropertyToID("_CTEpsilon");
-            public static readonly int Untextured = Shader.PropertyToID("_CTUntextured");
             public static readonly int TileSize = Shader.PropertyToID("_CTTileSize");
             public static readonly int DebugMode = Shader.PropertyToID("_CTDebugMode");
             public static readonly int DebugRange = Shader.PropertyToID("_CTDebugRange");
@@ -136,7 +134,6 @@ namespace ComputeTransparency
             public int reversedZ;
             public int depthTest;
             public float epsilon;
-            public int untextured;
             public int tileSize;
             public int segmentCount;
             public int debugMode;
@@ -191,6 +188,7 @@ namespace ComputeTransparency
 
         // Shader keywords rather than uniforms, for choices that are fixed for a whole dispatch.
         LocalKeyword m_KwTileReject;
+        LocalKeyword m_KwDebug, m_KwDepthTest, m_KwUntextured;
 
         public ComputeTransparencyPass(ComputeTransparencyRenderFeature.Settings settings, Material compositeMaterial)
         {
@@ -215,6 +213,10 @@ namespace ComputeTransparency
                 if (settings.rasterShader.HasKernel(name))
                     m_KRaster[i] = settings.rasterShader.FindKernel(name);
             }
+
+            m_KwDebug = new LocalKeyword(settings.rasterShader, "CT_DEBUG");
+            m_KwDepthTest = new LocalKeyword(settings.rasterShader, "CT_DEPTH_TEST");
+            m_KwUntextured = new LocalKeyword(settings.rasterShader, "CT_UNTEXTURED");
 
             if (settings.radixSortShader != null)
             {
@@ -254,15 +256,6 @@ namespace ComputeTransparency
             if (rasterKernel < 0)
                 return;
 
-            // Set on the shader asset while the graph is being recorded, not through the command
-            // buffer. cmd.SetKeyword inside a render graph pass needs AllowGlobalStateModification,
-            // and that inserts a sync point and forbids reordering across the pass - eight of them
-            // across the bin stage would cost more than the branch this replaces. Recording it here
-            // is what Unity's own compute shaders do, and it is safe as long as every dispatch of a
-            // given shader in a frame wants the same value, which is the case: the setting lives on
-            // the feature, not on the camera.
-            SetKeyword(m_Settings.binShader, m_KwTileReject, m_Settings.tileReject);
-
             bool gpuSort = m_Settings.sortMode == CTSortMode.GpuRadix && m_Settings.radixSortShader != null;
 
             if (!m_Collector.Collect(camera, !gpuSort))
@@ -301,6 +294,18 @@ namespace ComputeTransparency
 
             var sceneDepth = resourceData.cameraDepthTexture;
             bool depthTest = m_Settings.depthTest && sceneDepth.IsValid();
+
+            // Set on the shader asset while the graph is being recorded, not through the command
+            // buffer. cmd.SetKeyword inside a render graph pass needs AllowGlobalStateModification,
+            // and that inserts a sync point and forbids reordering across the pass - eight of them
+            // across the bin stage would cost more than the branch this replaces. Recording it here
+            // is what Unity's own compute shaders do, and it is safe as long as every dispatch of a
+            // given shader in a frame wants the same value, which is the case: the setting lives on
+            // the feature, not on the camera.
+            SetKeyword(m_Settings.binShader, m_KwTileReject, m_Settings.tileReject);
+            SetKeyword(m_Settings.rasterShader, m_KwDebug, m_Settings.debugMode != CTDebugMode.None);
+            SetKeyword(m_Settings.rasterShader, m_KwDepthTest, depthTest);
+            SetKeyword(m_Settings.rasterShader, m_KwUntextured, !m_Settings.textures);
 
             // Resources. The sprite buffer is persistent because the CPU writes it every frame;
             // everything else is transient so the graph can alias the memory.
@@ -571,7 +576,6 @@ namespace ComputeTransparency
                 data.reversedZ = SystemInfo.usesReversedZBuffer ? 1 : 0;
                 data.depthTest = depthTest ? 1 : 0;
                 data.epsilon = m_Settings.epsilon;
-                data.untextured = m_Settings.textures ? 0 : 1;
                 data.debugMode = (int)m_Settings.debugMode;
                 data.debugRange = m_Settings.debugRange;
                 data.sceneDepth = sceneDepth;
@@ -583,9 +587,7 @@ namespace ComputeTransparency
                     var cmd = ctx.cmd;
                     cmd.SetComputeVectorParam(d.shader, ShaderIds.ScreenSize, d.screenSize);
                     cmd.SetComputeIntParam(d.shader, ShaderIds.ReversedZ, d.reversedZ);
-                    cmd.SetComputeIntParam(d.shader, ShaderIds.DepthTestEnabled, d.depthTest);
                     cmd.SetComputeFloatParam(d.shader, ShaderIds.Epsilon, d.epsilon);
-                    cmd.SetComputeIntParam(d.shader, ShaderIds.Untextured, d.untextured);
                     cmd.SetComputeIntParam(d.shader, ShaderIds.DebugMode, d.debugMode);
                     cmd.SetComputeFloatParam(d.shader, ShaderIds.DebugRange, d.debugRange);
                     cmd.SetComputeIntParam(d.shader, ShaderIds.SegmentCount, d.segmentCount);

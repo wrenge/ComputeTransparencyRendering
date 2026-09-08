@@ -151,11 +151,6 @@ namespace ComputeTransparency
 
         public Settings settings = new Settings();
 
-        // Global rather than a material property: the hardware baseline is drawn immediate mode
-        // from CTInstancedSpriteBatch and the compute path from this pass, and the two have to
-        // switch together or an A/B between them measures the switch instead of the renderers.
-        static readonly int s_UntexturedId = Shader.PropertyToID("_CTUntextured");
-
         ComputeTransparencyPass m_Pass;
         CTTraditionalOverdrawPass m_OverdrawPass;
         Material m_CompositeMaterial;
@@ -188,9 +183,13 @@ namespace ComputeTransparency
                 renderingData.cameraData.cameraType == CameraType.Reflection)
                 return;
 
-            // The sense is inverted so that an unset global - a scene with this feature disabled,
-            // or the frames before it first runs - reads 0 and shades normally.
-            Shader.SetGlobalFloat(s_UntexturedId, settings.textures ? 0f : 1f);
+            // The hardware baseline is drawn immediate mode from CTInstancedSpriteBatch and the
+            // compute path from this feature's pass, and the two have to switch together or an A/B
+            // between them measures the switch instead of the renderers. Each side applies the
+            // keyword to something it owns - the batch to its material clone, the pass to the
+            // compute shader - because a global keyword set from inside the render loop does not
+            // stick, which cost an afternoon to find.
+            CTInstancedSpriteBatch.Untextured = !settings.textures;
 
             if (m_OverdrawPass != null && CTTraditionalOverdrawPass.Armed)
                 renderer.EnqueuePass(m_OverdrawPass);
