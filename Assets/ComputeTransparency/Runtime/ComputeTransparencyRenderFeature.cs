@@ -85,6 +85,16 @@ namespace ComputeTransparency
             [Range(4, 1024)]
             public int averagePrimitivesPerTile = 64;
 
+            [Tooltip("Test each tile against the triangle's three edges while binning instead of " +
+                     "taking its bounding box whole. A sprite is two triangles sharing the quad's " +
+                     "diagonal, so both of them carry the quad's bounds and without this every " +
+                     "tile the quad touches lists both halves - about half of every tile list is " +
+                     "primitives that cannot produce a pixel there.\n\n" +
+                     "The same test flags tiles a triangle covers completely, and the raster skips " +
+                     "the per pixel coverage test on those. Off is the old bounding box behaviour, " +
+                     "kept for the A/B.")]
+            public bool tileReject = true;
+
             [Tooltip("Reject sprite pixels hidden by opaque geometry. Needs the depth texture enabled " +
                      "on the URP asset.")]
             public bool depthTest = true;

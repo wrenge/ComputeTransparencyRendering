@@ -17,7 +17,7 @@
 #include "CTCommon.hlsl"
 
 StructuredBuffer<CTTri> _CTTriangles;
-StructuredBuffer<uint>  _CTTileList;
+StructuredBuffer<uint>  _CTTileList;       // CTPackEntry: triangle index, tile coverage in bit 0
 StructuredBuffer<uint>  _CTTileCount;      // raw overlap count, for the debug views only
 StructuredBuffer<uint>  _CTTileEnd;        // one past the tile's last slot in the pool
 StructuredBuffer<uint>  _CTTileSegCount;   // kept count per (tile, segment)
@@ -219,7 +219,9 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
                     continue;
 
                 // Every lane in the group reads the same triangle, so this stays a uniform load.
-                CTTri t = _CTTriangles[gsList[i]];
+                uint entry = gsList[i];
+                bool covered = CTEntryCovered(entry);
+                CTTri t = _CTTriangles[CTEntryTri(entry)];
                 float2 p0 = CTP0(t), p1 = CTP1(t), p2 = CTP2(t);
                 float2 uv0 = CTUV0(t), uv1 = CTUV1(t), uv2 = CTUV2(t);
                 float3 z = t.zLod.xyz;
@@ -242,7 +244,12 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
                 float w0 = EdgeFunction(p1, p2, pt, dir0);
                 float w1 = EdgeFunction(p2, p0, pt, dir1);
                 float w2 = EdgeFunction(p0, p1, pt, dir2);
-                if (!EdgeAccept(w0, dir0) || !EdgeAccept(w1, dir1) || !EdgeAccept(w2, dir2))
+
+                // Binning flagged this triangle as covering the whole tile, so no pixel here can
+                // fail and no pixel here sits on an edge - the fill rule has nothing to decide.
+                // The edge functions themselves are still needed: they are the barycentrics.
+                if (!covered &&
+                    (!EdgeAccept(w0, dir0) || !EdgeAccept(w1, dir1) || !EdgeAccept(w2, dir2)))
                     continue;
 
                 float invArea = 1.0 / area;

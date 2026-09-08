@@ -1157,3 +1157,201 @@ numbers come from `ScreenCapture.CaptureScreenshotAsTexture`, which reads the re
 
 The compute path moves more than the baseline does, which is the early-out shifting as well as the
 shading - exactly the confound noted above, visible in the numbers.
+
+## Work log — trivial reject and trivial fill
+
+Item 3 from the investigation list, and the answer to the third question it opened with: no, this
+renderer had no trivial reject and no trivial fill. Binning took a triangle's screen space bounding
+box and listed the triangle in every tile the box touched. That is a bad filter here for a specific
+reason: a sprite is one quad split into two triangles along its diagonal, so **both** halves carry
+the whole quad's bounds, and every tile the quad touches got both of them. Roughly half of every
+tile list was primitives that cannot produce a pixel in that tile, and the raster paid for them
+twice - once in the bitonic sort, which is superlinear in the segment length, and again in the walk.
+
+### What was added
+
+`CTBuildTileEdges` and `CTClassifyTile` in `CTCommon.hlsl`, used by `CSCount` and `CSScatter` in
+`CTBin.compute`, and a `covered` flag consumed by `CTRaster.compute`. One classify per (triangle,
+tile) pair returns outside, partial or covered:
+
+- **outside** - the triangle never enters that tile's list, so it costs nothing downstream.
+- **covered** - the triangle covers the whole tile, and the raster skips the per pixel coverage test.
+
+Counting and scattering have to agree tile for tile or the counts and the writes disagree, so both
+run the identical test from the identical setup function.
+
+The setup winds the triangle the same way the raster winds it, and builds the three edge functions
+in the same order, so "inside" means the same thing on both sides. Per tile the cost is three
+multiply-adds and two comparisons against precomputed corner offsets: a tile is axis aligned, so
+which of its four corners maximises an edge is decided per axis by the sign of that axis'
+coefficient, and both extreme corners are a fixed offset from the tile origin, hoisted out of the
+loop by the setup.
+
+### The three decisions worth recording
+
+**The box tested is the whole tile, not the box of pixel centres.** The tile is half a pixel larger
+on every side than the pixels the raster actually samples, and that slack is what makes the test
+safe in floating point without an epsilon anywhere. This expression and the raster's per pixel one
+round differently - they are different expressions, compiled into different kernels - but the
+disagreement is on the order of a thousandth of a pixel against half a pixel of geometric margin.
+Reject uses the box's maximum, so it only fires when the whole tile plus its margin is outside;
+accept uses the box's minimum, which is stricter than accepting over pixel centres would be. Both
+errors are therefore in the direction that keeps pixels rather than loses them. A tuned epsilon
+would have had to be scaled by the edge coefficients and the screen size, and would still have been
+a guess; the geometry gives the margin for free.
+
+**The coverage flag rides in bit 0 of the list entry, not the top bit.** The raster recovers depth
+order by bitonic sorting the tile list on the raw value, so a flag above the index would sort every
+flagged entry away from the position its index earned - the sprites would come back out of order.
+Below the index it only breaks ties, and a triangle appears at most once in a tile, so there are
+none. `CTPackEntry` / `CTEntryTri` / `CTEntryCovered` keep that in one place. The `0xFFFFFFFF` pad
+the sort uses is unaffected: it still sorts last, and the walk never reads past the real count.
+
+**Degenerate triangles are dropped at bin time, under a tighter bound than the raster's.** The
+raster skips a triangle whose area is 1e-6 or below; binning drops one below 1e-7. Making the bin
+bound stricter keeps what binning discards a strict subset of what the raster would have discarded
+anyway, so a one ulp disagreement between the two kernels cannot cost a sprite.
+
+### What trivial fill does and does not save
+
+It removes the three `EdgeAccept` calls and the divergent `continue`. It does **not** remove the
+three edge function evaluations, because those values are the barycentrics - the uv interpolation
+and the depth test need them whether or not the pixel could have failed. Keeping them means the
+shaded result is bit-identical to the old path, which is what made the verification below possible.
+
+The further step is available and deliberately not taken yet: for a covered tile the canonical
+endpoint ordering inside `EdgeFunction` is pointless, because no pixel sits on an edge and the fill
+rule has nothing to decide, so a plain `Cross2` would do at roughly half the cost. That changes the
+last bits of the barycentrics and so the uv, which forfeits the bit-identical check. It belongs with
+the edge coefficient form of `CTTri` (`CTTri` 80 to 112 bytes), where the whole per pixel setup
+collapses to three multiply-adds and the check has to be a tolerance comparison rather than an
+equality.
+
+### Verified: the image does not change
+
+`tileReject` on the renderer feature switches the whole classify off, restoring the old bounding box
+binning, so the two can be captured back to back in one play session. 10000 sprites, 1847x1195,
+orbit camera frozen, textures on, compute path:
+
+| | scene pixels differing | max channel delta |
+|---|---|---|
+| tile 16, reject on vs off | 0 | 0 |
+| tile 16, control off vs off | 0 | 0 |
+| tile 8, reject on vs off | 0 | 0 |
+| tile 8, control off vs off | 0 | 0 |
+
+Bit-identical over 2.2 million pixels, at two tile sizes, with a same-settings control proving the
+comparison can see a difference at all.
+
+A note on the method, because the first run of it lied: the demo panel redraws its own numbers every
+frame, so **any** two captures differ inside it. The first mask was cut from the bounding box of the
+control diff and was too small - it missed the panel's bottom edge, and the tile 8 comparison came
+back with nine differing pixels that were the panel's own text. The control had eight of them at the
+same coordinates, which is what identified them. Mask the whole panel, not the part that happened to
+change in one pair.
+
+### Measured: what it does to the tile lists
+
+Tile Load view, 50000 sprites, tile 16, four segments, `debugRange` 512, as a share of the screen
+outside the panel. The view's colours are read back by class rather than by inverting the ramp, so
+these are buckets, not means:
+
+| primitives binned into the tile | reject off | reject on |
+|---|---|---|
+| 128 - 256 | 0.0% | 7.2% |
+| 256 - 384 | 0.2% | 89.3% |
+| 384 - 512 | 6.1% | 3.4% |
+| 512 and over | 31.0% | 0.0% |
+| **overflowed and dropped primitives** | **62.7%** | **0.1%** |
+
+The distribution moves down by about a factor of two, which is exactly what the two-triangles-share-
+the-quad's-bounds argument predicts, and the magenta collapses. That second row is not a performance
+result, it is a correctness one: at 50000 sprites this scene was silently dropping primitives over
+five eighths of the screen, and now it is not. The 256 per segment cap had not changed - the lists
+simply stopped being padded with primitives that could not draw.
+
+### Measured: frame time
+
+Whole frame wall clock, editor, Metal, vSync off and the 300 fps cap removed, each sample averaged
+over 8500 to 12800 frames with the camera frozen:
+
+| | reject off | reject on | repeat, off |
+|---|---|---|---|
+| 10000 sprites, tile 16 | 4.677 ms | 4.475 ms | 4.682 ms |
+| 50000 sprites, tile 16 | 6.690 ms | 6.455 ms | - |
+
+4.3% and 3.5%. The repeat puts the run to run noise at 0.005 ms, so a 0.20 ms difference is real,
+but read the size of it with two things in mind.
+
+The first is that this is whole frame wall clock, the instrument this document has complained about
+throughout: it bundles the CPU gather, the CPU depth sort (this ran in `Cpu` sort mode), the editor's
+own overhead and every one of the eleven dispatches into one number, and the binning and raster
+passes are only part of it. The per pass timers that would apportion it are wired and still silent
+on Metal.
+
+The second is that at 50000 the comparison is unfair to the new path in the off direction: reject off
+was dropping primitives over most of the screen, so it was doing *less* raster work and producing a
+wrong image, and it was still slower. The honest single number is the 10000 sprite row, where both
+configurations render the identical image.
+
+### The switch
+
+`tileReject` on the renderer feature, default on, no demo panel row - the inspector is enough, and
+the panel is for things a person watches while the camera moves. Off restores bounding box binning
+exactly, including packing the coverage flag as zero, so the entry format does not depend on the
+setting.
+
+## Work log — tile reject as a keyword instead of a uniform
+
+`_CTTileReject` was a uniform read inside the tile loop of `CSCount` and `CSScatter`. The choice is
+fixed for the whole dispatch, so it is a compile time choice wearing a runtime disguise: the branch
+itself is scalar and nearly free, but keeping it forces the compiler to emit `CTBuildTileEdges` and
+the classify in both configurations. `#pragma multi_compile _ CT_TILE_REJECT` and two `#ifdef`s
+remove them from the variant that does not want them.
+
+### How the keyword is set, and why not through the command buffer
+
+`ComputeCommandBuffer` does expose `SetKeyword(ComputeShader, in LocalKeyword, bool)`, but using it
+inside a render graph pass requires `builder.AllowGlobalStateModification(true)`, and the render
+graph documentation is explicit about what that costs: *"This will introduce a render graph sync
+point in the frame and cause all passes after this pass to never be reordered before this pass"*,
+and it forces `AllowPassCulling(false)` as well. Eight sync points across the bin stage to remove a
+scalar branch is a bad trade.
+
+So the keyword is set on the shader asset while the graph is recorded, once per frame, before any
+pass is added. That is what Unity's own compute shaders do - `STP.cs` sets `shaderKeywords = null`
+and then `EnableKeyword` inside the `AddComputePass` scope. It is safe here because every dispatch
+of `binShader` in a frame wants the same value: the setting lives on the renderer feature, not on
+the camera, so two cameras cannot disagree. The day one shader needs two different values in one
+frame, this pattern breaks and the sync point becomes unavoidable.
+
+`SetKeyword` is wrapped in a guard that skips an invalid keyword. Setting a keyword a compute shader
+does not declare logs an error *per call*, which at one call per frame is a console that scrolls, and
+the failure mode - a shader asset older than the code - deserves a missing optimisation rather than
+that.
+
+### Verified
+
+10000 sprites, tile 16, camera frozen, panel masked: keyword on versus off, **0 differing scene
+pixels**, exactly as the uniform version measured.
+
+That test alone cannot tell a working keyword from a stuck one, so the positive control is the Tile
+Load view at `debugRange` 128, as a share of the screen:
+
+| primitives binned into the tile | reject off | reject on |
+|---|---|---|
+| 0 - 32 | 0.00% | 0.11% |
+| 32 - 64 | 0.21% | 34.20% |
+| 64 - 96 | 7.68% | 35.44% |
+| 96 - 128 | 38.40% | 0.02% |
+| 128 and over | 18.51% | 0.00% |
+
+The distribution halves, which is the same result the uniform version produced, so the keyword is
+genuinely switching the compiled variant.
+
+### The cost
+
+`multi_compile` applies to the whole file, so all eight bin kernels are compiled twice, not just the
+two that read the keyword. They are small and this is the cheapest of the keyword conversions; the
+raster kernel, where the same treatment is worth much more, already has four variants for tile size
+and needs the variant count watched.

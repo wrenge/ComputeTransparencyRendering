@@ -189,6 +189,9 @@ namespace ComputeTransparency
         readonly int[] m_KRaster = { -1, -1, -1, -1 };
         int m_KSortPrepare, m_KSortCount, m_KSortScanBlocks, m_KSortScanBlockSums, m_KSortScanAdd, m_KSortScatter;
 
+        // Shader keywords rather than uniforms, for choices that are fixed for a whole dispatch.
+        LocalKeyword m_KwTileReject;
+
         public ComputeTransparencyPass(ComputeTransparencyRenderFeature.Settings settings, Material compositeMaterial)
         {
             m_Settings = settings;
@@ -204,6 +207,7 @@ namespace ComputeTransparency
             m_KScanAdd = settings.binShader.FindKernel("CSScanAdd");
             m_KSegBase = settings.binShader.FindKernel("CSSegBase");
             m_KScatter = settings.binShader.FindKernel("CSScatter");
+            m_KwTileReject = new LocalKeyword(settings.binShader, "CT_TILE_REJECT");
 
             for (int i = 0; i < m_KRaster.Length; i++)
             {
@@ -249,6 +253,15 @@ namespace ComputeTransparency
             int rasterKernel = ResolveRasterKernel(ref tileSize);
             if (rasterKernel < 0)
                 return;
+
+            // Set on the shader asset while the graph is being recorded, not through the command
+            // buffer. cmd.SetKeyword inside a render graph pass needs AllowGlobalStateModification,
+            // and that inserts a sync point and forbids reordering across the pass - eight of them
+            // across the bin stage would cost more than the branch this replaces. Recording it here
+            // is what Unity's own compute shaders do, and it is safe as long as every dispatch of a
+            // given shader in a frame wants the same value, which is the case: the setting lives on
+            // the feature, not on the camera.
+            SetKeyword(m_Settings.binShader, m_KwTileReject, m_Settings.tileReject);
 
             bool gpuSort = m_Settings.sortMode == CTSortMode.GpuRadix && m_Settings.radixSortShader != null;
 
@@ -794,6 +807,18 @@ namespace ComputeTransparency
             cmd.SetComputeIntParam(d.shader, ShaderIds.SortBlockCount, d.blockCount);
             cmd.SetComputeIntParam(d.shader, ShaderIds.SortShift, d.shift);
             cmd.SetComputeIntParam(d.shader, ShaderIds.SortHistogramSize, d.histogramSize);
+        }
+
+        /// <summary>
+        /// Pushes a compile time choice to a compute shader. A keyword the shader does not declare
+        /// logs an error on every call, so an invalid one is skipped: that happens when the shader
+        /// asset is older than the code, and a missing optimisation is a better outcome than a
+        /// console full of errors.
+        /// </summary>
+        static void SetKeyword(ComputeShader shader, in LocalKeyword keyword, bool value)
+        {
+            if (shader != null && keyword.isValid)
+                shader.SetKeyword(keyword, value);
         }
 
         static void SetBinConstants(ComputeCommandBuffer cmd, ComputePassData d)

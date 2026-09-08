@@ -16,6 +16,12 @@
 #pragma kernel CSSegBase
 #pragma kernel CSScatter
 
+// Edge based tile reject and the tile coverage flag, compiled in or out rather than branched on:
+// the choice is fixed for the whole dispatch, so a uniform branch would only cost the compiler the
+// chance to drop the edge setup entirely. Every kernel in this file is compiled twice for it, but
+// they are all small and only these two read it.
+#pragma multi_compile _ CT_TILE_REJECT
+
 #include "CTCommon.hlsl"
 
 StructuredBuffer<CTTri> _CTTriangles;
@@ -70,6 +76,11 @@ void CSClear(uint3 id : SV_DispatchThreadID)
         _CTBlockSums[i] = 0;
 }
 
+// Counting and scattering have to agree tile for tile, so both walk the bounding box range and
+// both run the same edge test on each tile in it. The bounding box on its own is a poor filter
+// here: a sprite is two triangles sharing the quad's diagonal, so each of them has the quad's
+// bounds and every tile the quad touches gets both halves even though roughly half of each
+// tile's list can produce no pixel at all.
 [numthreads(64, 1, 1)]
 void CSCount(uint3 id : SV_DispatchThreadID)
 {
@@ -77,9 +88,17 @@ void CSCount(uint3 id : SV_DispatchThreadID)
     if (i >= _CTTriCount)
         return;
 
+    CTTri t = _CTTriangles[i];
+
     uint2 tileLo, tileHi;
-    if (!TriTileRange(_CTTriangles[i], tileLo, tileHi))
+    if (!TriTileRange(t, tileLo, tileHi))
         return;
+
+#ifdef CT_TILE_REJECT
+    CTTileEdges edges = CTBuildTileEdges(t, (float)_CTTileSize);
+    if (!edges.valid)
+        return;
+#endif
 
     uint seg = CTSegmentOf(i, _CTTriCount, _CTSegmentCount);
 
@@ -88,6 +107,10 @@ void CSCount(uint3 id : SV_DispatchThreadID)
         uint row = ty * _CTTileParams.x;
         for (uint tx = tileLo.x; tx <= tileHi.x; tx++)
         {
+#ifdef CT_TILE_REJECT
+            if (CTClassifyTile(edges, uint2(tx, ty), (float)_CTTileSize) == CT_TILE_OUTSIDE)
+                continue;
+#endif
             uint prev;
             InterlockedAdd(_CTTileSegCount[(row + tx) * _CTSegmentCount + seg], 1, prev);
         }
@@ -228,9 +251,17 @@ void CSScatter(uint3 id : SV_DispatchThreadID)
     if (i >= _CTTriCount)
         return;
 
+    CTTri t = _CTTriangles[i];
+
     uint2 tileLo, tileHi;
-    if (!TriTileRange(_CTTriangles[i], tileLo, tileHi))
+    if (!TriTileRange(t, tileLo, tileHi))
         return;
+
+#ifdef CT_TILE_REJECT
+    CTTileEdges edges = CTBuildTileEdges(t, (float)_CTTileSize);
+    if (!edges.valid)
+        return;
+#endif
 
     uint seg = CTSegmentOf(i, _CTTriCount, _CTSegmentCount);
 
@@ -239,13 +270,24 @@ void CSScatter(uint3 id : SV_DispatchThreadID)
         uint row = ty * _CTTileParams.x;
         for (uint tx = tileLo.x; tx <= tileHi.x; tx++)
         {
+            // The other half of the same classify: a tile the triangle covers completely is
+            // flagged in the entry, and the raster takes every pixel in it without testing.
+#ifdef CT_TILE_REJECT
+            uint cls = CTClassifyTile(edges, uint2(tx, ty), (float)_CTTileSize);
+            if (cls == CT_TILE_OUTSIDE)
+                continue;
+            uint covered = (cls == CT_TILE_COVERED) ? 1u : 0u;
+#else
+            uint covered = 0;
+#endif
+
             uint idx = (row + tx) * _CTSegmentCount + seg;
             uint dst;
             InterlockedAdd(_CTTileSegCursor[idx], 1, dst);
 
             uint segEnd = _CTTileSegBase[idx] + _CTTileSegCount[idx];
             if (dst < segEnd && dst < _CTTileListCapacity)
-                _CTTileList[dst] = i;
+                _CTTileList[dst] = CTPackEntry(i, covered);
         }
     }
 }

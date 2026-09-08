@@ -103,6 +103,87 @@ float3 CTHeat(float t)
     return c;
 }
 
+// A tile list entry: the triangle index with a "covers this whole tile" flag in bit 0.
+// The flag has to sit below the index rather than above it. The raster recovers depth order by
+// sorting the list on the raw value, so a high bit would sort every flagged entry away from the
+// position its index earned; a low bit only ever breaks ties that cannot happen, because a
+// triangle appears at most once in a tile.
+uint CTPackEntry(uint triIndex, uint covered) { return (triIndex << 1) | covered; }
+uint CTEntryTri(uint entry)                   { return entry >> 1; }
+bool CTEntryCovered(uint entry)               { return (entry & 1u) != 0u; }
+
+// Per tile classification of a triangle, the two halves of the usual trivial reject / trivial
+// accept pair.
+#define CT_TILE_OUTSIDE 0
+#define CT_TILE_PARTIAL 1
+#define CT_TILE_COVERED 2
+
+// Edge setup for that test. Edge k is e(p) = a[k]*p.x + b[k]*p.y + c[k], positive strictly
+// inside, built after winding the triangle the way the raster winds it so that "inside" means
+// the same thing on both sides.
+struct CTTileEdges
+{
+    float3 a;
+    float3 b;
+    float3 c;
+    float3 offMax;   // e at the tile corner furthest along the edge's inward normal
+    float3 offMin;   // e at the corner furthest against it
+    uint   valid;    // 0 for a degenerate triangle, which covers nothing anywhere
+};
+
+CTTileEdges CTBuildTileEdges(CTTri t, float tileSize)
+{
+    float2 p0 = CTP0(t), p1 = CTP1(t), p2 = CTP2(t);
+
+    CTTileEdges e;
+
+    // The raster drops a triangle whose area falls to 1e-6 or below. The bound here is tighter
+    // on purpose, so what binning discards stays a strict subset of what the raster would have
+    // discarded anyway and a one ulp disagreement between the two kernels cannot cost a sprite.
+    float area = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+    e.valid = (abs(area) < 1e-7) ? 0u : 1u;
+
+    // Same winding fix the raster applies, for the same reason: sprites are two sided, so a
+    // back facing triangle is turned around rather than culled.
+    if (area < 0.0)
+    {
+        float2 swap = p1;
+        p1 = p2;
+        p2 = swap;
+    }
+
+    // e(p) = Cross2(B - A, p - A) for the edges (p1,p2), (p2,p0), (p0,p1) - the same three the
+    // raster evaluates per pixel, in the same order.
+    e.a = -float3(p2.y - p1.y, p0.y - p2.y, p1.y - p0.y);
+    e.b =  float3(p2.x - p1.x, p0.x - p2.x, p1.x - p0.x);
+    e.c = -(e.a * float3(p1.x, p2.x, p0.x) + e.b * float3(p1.y, p2.y, p0.y));
+
+    // A tile is axis aligned, so which of its four corners maximises an edge is decided per axis
+    // by the sign of that axis' coefficient, and both extreme corners are a fixed offset from
+    // the tile's origin. Hoisting them here leaves three multiply-adds per tile below.
+    e.offMax = (max(e.a, 0.0) + max(e.b, 0.0)) * tileSize;
+    e.offMin = (min(e.a, 0.0) + min(e.b, 0.0)) * tileSize;
+    return e;
+}
+
+// Outside: no pixel in the tile can pass, so the triangle never has to enter the tile's list.
+// Covered: every pixel passes, so the raster can skip the coverage test entirely.
+//
+// The box tested is the whole tile, which is half a pixel larger on each side than the box of
+// pixel centres the raster actually samples. That slack is what makes the test safe in floating
+// point: half a pixel dwarfs the rounding difference between this expression and the raster's
+// per pixel one, so neither answer can be wrong in the direction that loses pixels.
+uint CTClassifyTile(CTTileEdges e, uint2 tile, float tileSize)
+{
+    float2 org = (float2)tile * tileSize;
+    float3 v = e.a * org.x + e.b * org.y + e.c;
+
+    if (any(v + e.offMax < 0.0))
+        return CT_TILE_OUTSIDE;
+
+    return all(v + e.offMin > 0.0) ? CT_TILE_COVERED : CT_TILE_PARTIAL;
+}
+
 // Conservative screen space bounds of a triangle, in pixels.
 void CTTriBounds(CTTri t, out float2 lo, out float2 hi)
 {
