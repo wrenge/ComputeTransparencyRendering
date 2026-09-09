@@ -53,39 +53,6 @@ uint   _CTSegmentCount;   // active segments, 1 .. CT_MAX_SEGMENTS
 groupshared uint gsList[CT_MAX_SEG_PRIMS];
 groupshared uint gsAlive;
 
-float Cross2(float2 a, float2 b)
-{
-    return a.x * b.y - a.y * b.x;
-}
-
-// Edge function evaluated from a canonical endpoint order. The two triangles a quad is
-// split into share its diagonal and walk it in opposite directions; evaluating the cross
-// product from each triangle's own leading vertex rounds the two results independently, so
-// a pixel sitting on that diagonal could come out positive for both halves (blended twice)
-// or negative for both (the sprite vanishes out of the middle of a stack). Ordering the two
-// endpoints the same way in both triangles makes the expression identical, and the single
-// negation below is exact, so the two values are always exact opposites.
-float EdgeFunction(float2 a, float2 b, float2 p, out float2 dir)
-{
-    dir = b - a;
-    bool flip = (a.x > b.x) || (a.x == b.x && a.y > b.y);
-    float2 lo = flip ? b : a;
-    float2 hi = flip ? a : b;
-    float w = Cross2(hi - lo, p - lo);
-    return flip ? -w : w;
-}
-
-// Top-left style fill rule: a pixel exactly on an edge belongs to exactly one of the two
-// triangles sharing it, picked by the direction the edge is walked in.
-bool EdgeAccept(float w, float2 dir)
-{
-    if (w > 0.0)
-        return true;
-    if (w < 0.0)
-        return false;
-    return (dir.y > 0.0) || (dir.y == 0.0 && dir.x < 0.0);
-}
-
 #ifdef CT_DEBUG
 // What the debug views draw. Alpha is written as 0 by the caller so the composite pass
 // replaces the frame rather than blending over it.
@@ -249,41 +216,30 @@ void RasterTile(uint tileSize, uint tileThreads, uint3 groupId, uint2 localId, u
                 CTTri t = _CTTriangles[CTEntryTri(entry)];
                 float2 p0 = CTP0(t), p1 = CTP1(t), p2 = CTP2(t);
                 float2 uv0 = CTUV0(t), uv1 = CTUV1(t), uv2 = CTUV2(t);
-                float3 z = t.zLod.xyz;
 
-                float area = Cross2(p1 - p0, p2 - p0);
-                if (abs(area) <= 1e-6)
-                    continue;
-
-                // Wind every triangle the same way rather than culling the back facing ones, so
-                // sprites stay two sided and the fill rule below has a consistent orientation.
-                if (area < 0.0)
-                {
-                    float2 tp = p1; p1 = p2; p2 = tp;
-                    float2 tuv = uv1; uv1 = uv2; uv2 = tuv;
-                    float tz = z.y; z.y = z.z; z.z = tz;
-                    area = -area;
-                }
-
-                float2 dir0, dir1, dir2;
-                float w0 = EdgeFunction(p1, p2, pt, dir0);
-                float w1 = EdgeFunction(p2, p0, pt, dir1);
-                float w2 = EdgeFunction(p0, p1, pt, dir2);
+                // Wound, non-degenerate and pre-divided by CSSetup, so what is left here is only
+                // what actually depends on the pixel: three cross products and a multiply.
+                uint flags = t.payload.z;
+                float w0 = CTEdgeFunction(p1, p2, pt, (flags & CT_TRI_FLIP0) != 0u);
+                float w1 = CTEdgeFunction(p2, p0, pt, (flags & CT_TRI_FLIP1) != 0u);
+                float w2 = CTEdgeFunction(p0, p1, pt, (flags & CT_TRI_FLIP2) != 0u);
 
                 // Binning flagged this triangle as covering the whole tile, so no pixel here can
                 // fail and no pixel here sits on an edge - the fill rule has nothing to decide.
                 // The edge functions themselves are still needed: they are the barycentrics.
                 if (!covered &&
-                    (!EdgeAccept(w0, dir0) || !EdgeAccept(w1, dir1) || !EdgeAccept(w2, dir2)))
+                    (!CTEdgeAccept(w0, (flags & CT_TRI_TIE0) != 0u) ||
+                     !CTEdgeAccept(w1, (flags & CT_TRI_TIE1) != 0u) ||
+                     !CTEdgeAccept(w2, (flags & CT_TRI_TIE2) != 0u)))
                     continue;
 
-                float invArea = 1.0 / area;
+                float invArea = CTTriInvArea(t);
                 float b0 = w0 * invArea;
                 float b1 = w1 * invArea;
                 float b2 = w2 * invArea;
 
 #ifdef CT_DEPTH_TEST
-                float depth = dot(float3(b0, b1, b2), z);
+                float depth = dot(float3(b0, b1, b2), t.zLod.xyz);
                 bool occluded = _CTReversedZ ? (depth < sceneDepth) : (depth > sceneDepth);
                 if (occluded)
                     continue;

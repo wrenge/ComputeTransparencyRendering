@@ -68,14 +68,29 @@ struct CTSpriteInstance
 #define CT_FLAG_BILLBOARD 1u
 
 // A screen space triangle produced by the setup kernel. Two per sprite. 80 bytes.
+//
+// The vertices arrive already wound counter-clockwise and the triangle's setup - the reciprocal
+// of twice its area and the per edge bits below - is computed once here rather than once per
+// pixel per tile in the raster's innermost loop. It all fits in space the struct already had, so
+// the hot loop reads the same 80 bytes it always did.
 struct CTTri
 {
-    float4 p01;      // p0.xy, p1.xy in screen pixels, y up
+    float4 p01;      // p0.xy, p1.xy in screen pixels, y up, wound counter-clockwise
     float4 p2uv0;    // p2.xy, uv0.xy
     float4 uv12;     // uv1.xy, uv2.xy
     float4 zLod;     // device depth at each vertex, w = mip level
-    uint4  payload;  // x = packed RGBA8 tint, y = slice, z = 0 when culled during setup
+    uint4  payload;  // x = packed RGBA8 tint, y = slice, z = CT_TRI_* bits, w = asuint(1/area)
 };
+
+// payload.z. Bit 0 survives from when the field was a plain valid flag; the rest is the edge
+// setup the raster used to redo per pixel.
+#define CT_TRI_VALID 1u
+#define CT_TRI_FLIP0 2u   // edge (p1,p2) is walked against the canonical endpoint order
+#define CT_TRI_FLIP1 4u   // edge (p2,p0)
+#define CT_TRI_FLIP2 8u   // edge (p0,p1)
+#define CT_TRI_TIE0  16u  // that edge keeps a pixel sitting exactly on it (the fill rule)
+#define CT_TRI_TIE1  32u
+#define CT_TRI_TIE2  64u
 
 float2 CTP0(CTTri t) { return t.p01.xy; }
 float2 CTP1(CTTri t) { return t.p01.zw; }
@@ -83,6 +98,58 @@ float2 CTP2(CTTri t) { return t.p2uv0.xy; }
 float2 CTUV0(CTTri t) { return t.p2uv0.zw; }
 float2 CTUV1(CTTri t) { return t.uv12.xy; }
 float2 CTUV2(CTTri t) { return t.uv12.zw; }
+
+bool  CTTriValid(CTTri t) { return (t.payload.z & CT_TRI_VALID) != 0u; }
+
+// 1 / (2 * signed area), the barycentric divisor. Positive, because the triangle is wound.
+float CTTriInvArea(CTTri t) { return asfloat(t.payload.w); }
+
+float Cross2(float2 a, float2 b)
+{
+    return a.x * b.y - a.y * b.x;
+}
+
+// The two per edge decisions the raster used to make for every pixel it tested, made once in
+// setup instead. Both depend only on the edge's endpoints.
+//
+// The first is the canonical endpoint order. The two triangles a quad is split into share its
+// diagonal and walk it in opposite directions; evaluating the cross product from each triangle's
+// own leading vertex rounds the two results independently, so a pixel on that diagonal could come
+// out positive for both halves (blended twice) or negative for both (the sprite vanishes out of
+// the middle of a stack). Ordering the endpoints the same way in both triangles makes the
+// expression identical, and the single negation is exact, so the two values are exact opposites.
+//
+// The second is the top-left style fill rule: of the two triangles sharing an edge, exactly one
+// keeps a pixel lying on it, picked by the direction the edge is walked in.
+uint CTEdgeBits(float2 a, float2 b, uint flipBit, uint tieBit)
+{
+    float2 dir = b - a;
+    uint bits = 0;
+    if ((a.x > b.x) || (a.x == b.x && a.y > b.y))
+        bits |= flipBit;
+    if ((dir.y > 0.0) || (dir.y == 0.0 && dir.x < 0.0))
+        bits |= tieBit;
+    return bits;
+}
+
+// Edge function at p, evaluated from the canonical end of the edge. flip comes from CTEdgeBits.
+float CTEdgeFunction(float2 a, float2 b, float2 p, bool flip)
+{
+    float2 lo = flip ? b : a;
+    float2 hi = flip ? a : b;
+    float w = Cross2(hi - lo, p - lo);
+    return flip ? -w : w;
+}
+
+// tie comes from CTEdgeBits and decides only the w == 0 case.
+bool CTEdgeAccept(float w, bool tie)
+{
+    if (w > 0.0)
+        return true;
+    if (w < 0.0)
+        return false;
+    return tie;
+}
 
 float4 CTUnpackColor(uint c)
 {
@@ -119,8 +186,9 @@ bool CTEntryCovered(uint entry)               { return (entry & 1u) != 0u; }
 #define CT_TILE_COVERED 2
 
 // Edge setup for that test. Edge k is e(p) = a[k]*p.x + b[k]*p.y + c[k], positive strictly
-// inside, built after winding the triangle the way the raster winds it so that "inside" means
-// the same thing on both sides.
+// inside. This is the coefficient form, not the form the raster evaluates: it is cheaper per
+// tile, and it is allowed to disagree at the last ulp because the box it is tested against is
+// half a pixel larger than the pixel grid on every side. See CTClassifyTile.
 struct CTTileEdges
 {
     float3 a;
@@ -128,29 +196,16 @@ struct CTTileEdges
     float3 c;
     float3 offMax;   // e at the tile corner furthest along the edge's inward normal
     float3 offMin;   // e at the corner furthest against it
-    uint   valid;    // 0 for a degenerate triangle, which covers nothing anywhere
 };
 
+// The triangle is wound counter-clockwise and non-degenerate by the time it gets here: setup
+// does both, and a triangle that failed either never reaches binning at all, because
+// TriTileRange drops it on CT_TRI_VALID first.
 CTTileEdges CTBuildTileEdges(CTTri t, float tileSize)
 {
     float2 p0 = CTP0(t), p1 = CTP1(t), p2 = CTP2(t);
 
     CTTileEdges e;
-
-    // The raster drops a triangle whose area falls to 1e-6 or below. The bound here is tighter
-    // on purpose, so what binning discards stays a strict subset of what the raster would have
-    // discarded anyway and a one ulp disagreement between the two kernels cannot cost a sprite.
-    float area = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
-    e.valid = (abs(area) < 1e-7) ? 0u : 1u;
-
-    // Same winding fix the raster applies, for the same reason: sprites are two sided, so a
-    // back facing triangle is turned around rather than culled.
-    if (area < 0.0)
-    {
-        float2 swap = p1;
-        p1 = p2;
-        p2 = swap;
-    }
 
     // e(p) = Cross2(B - A, p - A) for the edges (p1,p2), (p2,p0), (p0,p1) - the same three the
     // raster evaluates per pixel, in the same order.

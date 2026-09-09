@@ -50,7 +50,7 @@ bool TriTileRange(CTTri t, out uint2 tileLo, out uint2 tileHi)
 {
     tileLo = 0;
     tileHi = 0;
-    if (t.payload.z == 0)
+    if (!CTTriValid(t))
         return false;
 
     float2 lo, hi;
@@ -96,8 +96,6 @@ void CSCount(uint3 id : SV_DispatchThreadID)
 
 #ifdef CT_TILE_REJECT
     CTTileEdges edges = CTBuildTileEdges(t, (float)_CTTileSize);
-    if (!edges.valid)
-        return;
 #endif
 
     uint seg = CTSegmentOf(i, _CTTriCount, _CTSegmentCount);
@@ -259,8 +257,6 @@ void CSScatter(uint3 id : SV_DispatchThreadID)
 
 #ifdef CT_TILE_REJECT
     CTTileEdges edges = CTBuildTileEdges(t, (float)_CTTileSize);
-    if (!edges.valid)
-        return;
 #endif
 
     uint seg = CTSegmentOf(i, _CTTriCount, _CTSegmentCount);

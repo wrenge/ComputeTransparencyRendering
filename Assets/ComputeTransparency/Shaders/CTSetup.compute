@@ -1,6 +1,10 @@
 // Turns the depth sorted sprite list into screen space triangles.
-// Culled sprites keep their slot (with valid = 0) so that triangle index order stays
+// Culled sprites keep their slot (with CT_TRI_VALID clear) so that triangle index order stays
 // identical to depth order, which every later stage relies on.
+//
+// This is also where a triangle's pixel independent setup is done - winding, the degenerate
+// reject, the barycentric divisor and the per edge fill rule bits - so the raster's innermost
+// loop only evaluates what actually varies with the pixel.
 #pragma kernel CSSetup
 
 #include "CTCommon.hlsl"
@@ -19,17 +23,50 @@ float4   _CTCameraRight;   // xyz, world space
 float4   _CTCameraUp;      // xyz, world space
 uint     _CTSpriteCount;
 
+// Winds the triangle, rejects it if it has no area, and bakes the rest of its setup into the
+// struct. All of this used to run in the raster's innermost loop - once per pixel per tile per
+// triangle - even though none of it depends on the pixel. Twelve hundred pixels in a 32 pixel
+// tile redid the same reciprocal twelve hundred times.
 void EmitTri(uint index, float2 p0, float2 p1, float2 p2,
              float2 uv0, float2 uv1, float2 uv2,
              float z0, float z1, float z2,
              uint color, uint slice, float lod, uint valid)
 {
+    precise float area = Cross2(p1 - p0, p2 - p0);
+
+    // Same bound the raster used to apply. A triangle this thin is dropped rather than wound,
+    // because the barycentric divide below would be meaningless.
+    if (abs(area) <= 1e-6)
+        valid = 0;
+
+    // Wind every triangle the same way rather than culling the back facing ones, so sprites stay
+    // two sided and the fill rule has a consistent orientation. The negation is exact, so this is
+    // bit for bit what the raster produced when it did the swap itself.
+    if (area < 0.0)
+    {
+        float2 tp = p1; p1 = p2; p2 = tp;
+        float2 tuv = uv1; uv1 = uv2; uv2 = tuv;
+        float tz = z1; z1 = z2; z2 = tz;
+        area = -area;
+    }
+
+    uint flags = 0;
+    if (valid)
+    {
+        // The three edges in the order the raster evaluates them.
+        flags = CT_TRI_VALID
+              | CTEdgeBits(p1, p2, CT_TRI_FLIP0, CT_TRI_TIE0)
+              | CTEdgeBits(p2, p0, CT_TRI_FLIP1, CT_TRI_TIE1)
+              | CTEdgeBits(p0, p1, CT_TRI_FLIP2, CT_TRI_TIE2);
+    }
+
     CTTri t;
     t.p01 = float4(p0, p1);
     t.p2uv0 = float4(p2, uv0);
     t.uv12 = float4(uv1, uv2);
     t.zLod = float4(z0, z1, z2, lod);
-    t.payload = uint4(color, slice, valid, 0);
+    precise float inv = 1.0 / area;
+    t.payload = uint4(color, slice, flags, asuint(inv));
     _CTTriangles[index] = t;
 }
 
